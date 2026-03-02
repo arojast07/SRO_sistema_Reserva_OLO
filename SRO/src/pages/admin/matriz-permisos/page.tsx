@@ -101,6 +101,28 @@ const getPermissionLabel = (technicalName: string): string => {
     // Reportes
     'reports.view': 'Ver reportes',
     'reports.export': 'Exportar reportes',
+
+    // ✅ NUEVOS: Permisos de menú principal
+    'menu.dashboard.view': 'Ver menú Dashboard',
+    'menu.calendario.view': 'Ver menú Calendario',
+    'menu.reservas.view': 'Ver menú Reservas',
+    'menu.andenes.view': 'Ver menú Andenes',
+    'menu.manpower.view': 'Ver menú Manpower',
+    'menu.casetilla.view': 'Ver menú Punto Control IN/OUT',
+
+    // ✅ NUEVOS: Permisos de submenú Administración
+    'menu.admin.view': 'Ver menú Administración',
+    'menu.admin.usuarios.view': 'Ver menú Usuarios',
+    'menu.admin.roles.view': 'Ver menú Roles',
+    'menu.admin.matriz_permisos.view': 'Ver menú Matriz de Permisos',
+    'menu.admin.catalogos.view': 'Ver menú Catálogos',
+    'menu.admin.almacenes.view': 'Ver menú Almacenes',
+    'menu.admin.correspondencia.view': 'Ver menú Correspondencia',
+
+    // ✅ NUEVOS: Permisos de tabs de Correspondencia
+    'correspondence.gmail_account.view': 'Ver tab Cuenta Gmail',
+    'correspondence.rules.view': 'Ver tab Reglas de Correspondencia',
+    'correspondence.logs.view': 'Ver tab Bitácora de Envíos',
   };
 
   // Si existe traducción, usarla
@@ -140,6 +162,8 @@ const getPermissionLabel = (technicalName: string): string => {
       'time_profiles': 'perfiles de tiempo',
       'dashboard': 'panel',
       'reports': 'reportes',
+      'menu': 'menú',
+      'correspondence': 'correspondencia',
     };
 
     const actionLabel = actionLabels[action] || action;
@@ -166,6 +190,8 @@ const getCategoryLabel = (category: string): string => {
     'time_profiles': 'Perfiles de Tiempo',
     'dashboard': 'Panel de Control',
     'reports': 'Reportes',
+    'menu': 'Menú de Navegación',
+    'correspondence': 'Correspondencia',
   };
 
   return categoryLabels[category] || category;
@@ -173,7 +199,7 @@ const getCategoryLabel = (category: string): string => {
 
 export default function MatrizPermisosPage() {
   const { user } = useAuth();
-  const { orgId, loading: permissionsLoading } = usePermissions();
+  const { orgId, loading: permissionsLoading, can } = usePermissions();
 
   const [roles, setRoles] = useState<Role[]>([]);
   const [permissions, setPermissions] = useState<Permission[]>([]);
@@ -187,19 +213,26 @@ export default function MatrizPermisosPage() {
   const [canUpdateMatrix, setCanUpdateMatrix] = useState(false);
   const [permCheckLoading, setPermCheckLoading] = useState(true);
 
+  // ✅ Validación directa por rol (ADMIN o Full Access tienen acceso total)
+  const hasDirectAccess = user?.role === 'ADMIN' || user?.role === 'Full Access';
+
   useEffect(() => {
     console.log('[MatrizPermisos] usePermissions return', {
       orgId,
       permissionsLoading,
-      userId: user?.id
+      userId: user?.id,
+      userRole: user?.role,
+      hasDirectAccess
     });
-  }, [orgId, permissionsLoading, user?.id]);
+  }, [orgId, permissionsLoading, user?.id, user?.role, hasDirectAccess]);
 
   useEffect(() => {
     if (!permissionsLoading && orgId && user?.id) {
       console.log('[AdminMatrix] mounted', {
         orgId,
-        userId: user.id
+        userId: user.id,
+        userRole: user.role,
+        hasDirectAccess
       });
       checkRoleAndPerms();
     }
@@ -210,6 +243,16 @@ export default function MatrizPermisosPage() {
     try {
       setRoleCheckLoading(true);
       setPermCheckLoading(true);
+
+      // ✅ Si tiene acceso directo por rol (ADMIN o Full Access), otorgar permisos completos
+      if (hasDirectAccess) {
+        console.log('[MatrizPermisos] Direct access granted via role:', user?.role);
+        setRoleName(user?.role || 'ADMIN');
+        setCanViewMatrix(true);
+        setCanUpdateMatrix(true);
+        loadData();
+        return;
+      }
 
       // 1) ✅ Buscar la asignación en user_org_roles (sin JOIN para evitar errores)
       const uorRes = await supabase
@@ -249,9 +292,19 @@ export default function MatrizPermisosPage() {
 
       if (roleRes.error) throw roleRes.error;
 
-      setRoleName(roleRes.data?.name ?? null);
+      const fetchedRoleName = roleRes.data?.name ?? null;
+      setRoleName(fetchedRoleName);
 
-      // 3) ✅ Ver permisos reales con RPC
+      // ✅ Si el rol obtenido es Full Access, otorgar acceso completo
+      if (fetchedRoleName === 'Full Access' || fetchedRoleName === 'ADMIN') {
+        console.log('[MatrizPermisos] Full access via fetched role:', fetchedRoleName);
+        setCanViewMatrix(true);
+        setCanUpdateMatrix(true);
+        loadData();
+        return;
+      }
+
+      // 3) ✅ Ver permisos reales con RPC (solo si no tiene acceso directo)
       const [viewRes, updateRes] = await Promise.all([
         supabase.rpc('has_org_permission', {
           p_org_id: orgId,
@@ -273,8 +326,9 @@ export default function MatrizPermisosPage() {
       if (viewRes.error) throw viewRes.error;
       if (updateRes.error) throw updateRes.error;
 
-      const canView = Boolean(viewRes.data);
-      const canUpdate = Boolean(updateRes.data);
+      // ✅ Combinar: acceso directo O permiso granular
+      const canView = Boolean(viewRes.data) || can('admin.matrix.view');
+      const canUpdate = Boolean(updateRes.data) || can('admin.matrix.update');
 
       setCanViewMatrix(canView);
       setCanUpdateMatrix(canUpdate);
@@ -286,10 +340,18 @@ export default function MatrizPermisosPage() {
       }
     } catch (error) {
       console.error('[MatrizPermisos] Error checking role/perms:', error);
-      setRoleName(null);
-      setCanViewMatrix(false);
-      setCanUpdateMatrix(false);
-      setLoading(false);
+      // ✅ En caso de error, verificar acceso directo como fallback
+      if (hasDirectAccess) {
+        setRoleName(user?.role || null);
+        setCanViewMatrix(true);
+        setCanUpdateMatrix(true);
+        loadData();
+      } else {
+        setRoleName(null);
+        setCanViewMatrix(false);
+        setCanUpdateMatrix(false);
+        setLoading(false);
+      }
     } finally {
       setRoleCheckLoading(false);
       setPermCheckLoading(false);

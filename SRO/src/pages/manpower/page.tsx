@@ -320,7 +320,7 @@ const handleDelete = async (collaborator: Collaborator) => {
         <div className="mb-8">
           <div className="flex items-center justify-between mb-2">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">Manpower Forecasting</h1>
+              <h1 className="text-3xl font-bold text-gray-900">Manpower</h1>
               <p className="text-gray-600 mt-1">
                 Gestión de colaboradores y asignación de almacenes
               </p>

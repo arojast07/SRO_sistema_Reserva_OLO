@@ -29,6 +29,9 @@ const isUuid = (v: string) =>
 
 const uniq = (arr: string[]) => Array.from(new Set(arr));
 
+// ✅ Generar reqId para tracking
+const reqId = () => crypto.randomUUID();
+
 // ✅ NUEVO: asegura sesión antes de invocar edge functions
 const ensureSession = async () => {
   const snap1 = await supabase.auth.getSession();
@@ -81,68 +84,39 @@ const safeReadResponseText = async (ctx: any) => {
 
 export const userAccessService = {
   async get(orgId: string, targetUserId: string): Promise<UserAccessResponse> {
+    const id = reqId();
+    
     assert(orgId && isUuid(orgId), 'orgId inválido');
     assert(targetUserId && isUuid(targetUserId), 'targetUserId inválido');
 
     // ✅ asegura sesión
     await ensureSession();
 
-    const { data, error } = await supabase.functions.invoke('admin-user-access', {
-      body: { action: 'get', orgId, targetUserId, debug: true },
-    });
-
-    if (error) {
-      const ctx = (error as any)?.context;
-      console.error('[userAccessService.get] invoke error', {
-        message: error.message,
-        hasContext: !!ctx,
-        status: (ctx as any)?.status,
-        statusText: (ctx as any)?.statusText,
-        details: (error as any)?.details,
-      });
-
-      const raw = await safeReadResponseText(ctx);
-      if (raw) console.error('[userAccessService.get] raw response body', raw);
-
-      throw new Error(`Error al obtener accesos: ${error.message}`);
-    }
-
-    if (data && typeof data === 'object' && 'error' in (data as any)) {
-      throw new Error(`Error del servidor: ${(data as any).error}`);
-    }
-
-    return {
-      countryIds: Array.isArray((data as any)?.countryIds) ? (data as any).countryIds : [],
-      warehouseIds: Array.isArray((data as any)?.warehouseIds) ? (data as any).warehouseIds : [],
-      restricted: !!(data as any)?.restricted,
+    // ✅ CORREGIDO: Payload en camelCase con action="get"
+    const payload = {
+      action: 'get',
+      orgId,
+      targetUserId,
     };
-  },
 
-  async setCountries(params: SetCountriesParams): Promise<void> {
-    assert(params?.orgId && isUuid(params.orgId), 'orgId inválido');
-    assert(params?.targetUserId && isUuid(params.targetUserId), 'targetUserId inválido');
-    assert(Array.isArray(params?.countryIds), 'countryIds debe ser array');
-
-    const countryIds = uniq(params.countryIds.filter(Boolean));
-    countryIds.forEach((id) => assert(isUuid(id), 'countryIds contiene uuid inválido'));
-
-    // ✅ asegura sesión
-    await ensureSession();
+    console.log('[userAccessService.get] 📤 Request payload', { reqId: id, payload });
 
     const { data, error } = await supabase.functions.invoke('admin-user-access', {
-      body: {
-        action: 'set_countries',
-        orgId: params.orgId,
-        targetUserId: params.targetUserId,
-        countryIds,
-        debug: true,
-      },
+      body: payload,
+    });
+
+    console.log('[userAccessService.get] 📥 Response', {
+      reqId: id,
+      hasData: !!data,
+      hasError: !!error,
+      data,
+      error,
     });
 
     if (error) {
       const ctx = (error as any)?.context;
-
-      console.error('[userAccessService.setCountries] invoke error', {
+      console.error('[userAccessService.get] ❌ Invoke error', {
+        reqId: id,
         message: error.message,
         hasContext: !!ctx,
         status: (ctx as any)?.status,
@@ -152,10 +126,81 @@ export const userAccessService = {
 
       const raw = await safeReadResponseText(ctx);
       if (raw) {
-        console.error('[userAccessService.setCountries] raw response body', raw);
+        console.error('[userAccessService.get] 📄 Raw response body', { reqId: id, raw });
+      }
+
+      throw new Error(`Error al obtener accesos: ${error.message}`);
+    }
+
+    if (data && typeof data === 'object' && 'error' in (data as any)) {
+      console.error('[userAccessService.get] ❌ Server error', { reqId: id, serverError: (data as any).error });
+      throw new Error(`Error del servidor: ${(data as any).error}`);
+    }
+
+    const result = {
+      countryIds: Array.isArray((data as any)?.countryIds) ? (data as any).countryIds : [],
+      warehouseIds: Array.isArray((data as any)?.warehouseIds) ? (data as any).warehouseIds : [],
+      restricted: !!(data as any)?.restricted,
+    };
+
+    console.log('[userAccessService.get] ✅ Success', { reqId: id, result });
+
+    return result;
+  },
+
+  async setCountries(params: SetCountriesParams): Promise<void> {
+    const id = reqId();
+    
+    assert(params?.orgId && isUuid(params.orgId), 'orgId inválido');
+    assert(params?.targetUserId && isUuid(params.targetUserId), 'targetUserId inválido');
+    assert(Array.isArray(params?.countryIds), 'countryIds debe ser array');
+
+    const countryIds = uniq(params.countryIds.filter(Boolean));
+    countryIds.forEach((cid) => assert(isUuid(cid), 'countryIds contiene uuid inválido'));
+
+    // ✅ asegura sesión
+    await ensureSession();
+
+    // ✅ CORREGIDO: Payload en camelCase con action="set_countries"
+    const payload = {
+      action: 'set_countries',
+      orgId: params.orgId,
+      targetUserId: params.targetUserId,
+      countryIds,
+    };
+
+    console.log('[userAccessService.setCountries] 📤 Request payload', { reqId: id, payload });
+
+    const { data, error } = await supabase.functions.invoke('admin-user-access', {
+      body: payload,
+    });
+
+    console.log('[userAccessService.setCountries] 📥 Response', {
+      reqId: id,
+      hasData: !!data,
+      hasError: !!error,
+      data,
+      error,
+    });
+
+    if (error) {
+      const ctx = (error as any)?.context;
+
+      console.error('[userAccessService.setCountries] ❌ Invoke error', {
+        reqId: id,
+        message: error.message,
+        hasContext: !!ctx,
+        status: (ctx as any)?.status,
+        statusText: (ctx as any)?.statusText,
+        details: (error as any)?.details,
+      });
+
+      const raw = await safeReadResponseText(ctx);
+      if (raw) {
+        console.error('[userAccessService.setCountries] 📄 Raw response body', { reqId: id, raw });
         try {
           const parsed = JSON.parse(raw);
-          console.error('[userAccessService.setCountries] parsed server body', parsed);
+          console.error('[userAccessService.setCountries] 📋 Parsed server body', { reqId: id, parsed });
 
           if (parsed?.error) {
             const extra = [
@@ -178,37 +223,55 @@ export const userAccessService = {
     }
 
     if (data && typeof data === 'object' && 'error' in (data as any)) {
+      console.error('[userAccessService.setCountries] ❌ Server error', { reqId: id, serverError: (data as any).error });
       throw new Error(`Error del servidor: ${(data as any).error}`);
     }
+
+    console.log('[userAccessService.setCountries] ✅ Success', { reqId: id });
   },
 
   async setWarehouses(params: SetWarehousesParams): Promise<void> {
+    const id = reqId();
+    
     assert(params?.orgId && isUuid(params.orgId), 'orgId inválido');
     assert(params?.targetUserId && isUuid(params.targetUserId), 'targetUserId inválido');
     assert(typeof params?.restricted === 'boolean', 'restricted debe ser boolean');
     assert(Array.isArray(params?.warehouseIds), 'warehouseIds debe ser array');
 
     const warehouseIds = uniq(params.warehouseIds.filter(Boolean));
-    warehouseIds.forEach((id) => assert(isUuid(id), 'warehouseIds contiene uuid inválido'));
+    warehouseIds.forEach((wid) => assert(isUuid(wid), 'warehouseIds contiene uuid inválido'));
 
     // ✅ asegura sesión
     await ensureSession();
 
+    // ✅ CORREGIDO: Payload en camelCase con action="set_warehouses"
+    const payload = {
+      action: 'set_warehouses',
+      orgId: params.orgId,
+      targetUserId: params.targetUserId,
+      restricted: params.restricted,
+      warehouseIds: params.restricted ? warehouseIds : [],
+    };
+
+    console.log('[userAccessService.setWarehouses] 📤 Request payload', { reqId: id, payload });
+
     const { data, error } = await supabase.functions.invoke('admin-user-access', {
-      body: {
-        action: 'set_warehouses',
-        orgId: params.orgId,
-        targetUserId: params.targetUserId,
-        restricted: params.restricted,
-        warehouseIds: params.restricted ? warehouseIds : [],
-        debug: true,
-      },
+      body: payload,
+    });
+
+    console.log('[userAccessService.setWarehouses] 📥 Response', {
+      reqId: id,
+      hasData: !!data,
+      hasError: !!error,
+      data,
+      error,
     });
 
     if (error) {
       const ctx = (error as any)?.context;
 
-      console.error('[userAccessService.setWarehouses] invoke error', {
+      console.error('[userAccessService.setWarehouses] ❌ Invoke error', {
+        reqId: id,
         message: error.message,
         hasContext: !!ctx,
         status: (ctx as any)?.status,
@@ -218,11 +281,11 @@ export const userAccessService = {
 
       const raw = await safeReadResponseText(ctx);
       if (raw) {
-        console.error('[userAccessService.setWarehouses] raw response body', raw);
+        console.error('[userAccessService.setWarehouses] 📄 Raw response body', { reqId: id, raw });
 
         try {
           const parsed = JSON.parse(raw);
-          console.error('[userAccessService.setWarehouses] parsed server body', parsed);
+          console.error('[userAccessService.setWarehouses] 📋 Parsed server body', { reqId: id, parsed });
 
           if (parsed?.error) {
             const extra = [
@@ -247,7 +310,10 @@ export const userAccessService = {
     }
 
     if (data && typeof data === 'object' && 'error' in (data as any)) {
+      console.error('[userAccessService.setWarehouses] ❌ Server error', { reqId: id, serverError: (data as any).error });
       throw new Error(`Error del servidor: ${(data as any).error}`);
     }
+
+    console.log('[userAccessService.setWarehouses] ✅ Success', { reqId: id });
   },
 };

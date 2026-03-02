@@ -1,392 +1,401 @@
 // supabase/functions/admin-user-access/index.ts
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const BUILD_TAG = "admin-user-access-2026-01-28_v4_cors_and_perm_fix";
+const VERSION = "admin-user-access@v2026-02-09.2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Max-Age": "86400",
-  // ✅ opcional pero útil para caches intermedios
-  "Vary": "Origin",
 };
 
-const json = (status: number, body: unknown) =>
-  new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-      "x-build-tag": BUILD_TAG,
-    },
-  });
+function reqId() {
+  return crypto.randomUUID();
+}
 
-function log(tag: string, data?: unknown) {
-  try {
-    console.log(`[admin-user-access] ${tag}`, data ? JSON.stringify(data) : "");
-  } catch {
-    console.log(`[admin-user-access] ${tag}`);
-  }
+function safePrefix(v: string | null, n = 14) {
+  if (!v) return null;
+  return v.slice(0, n);
+}
+
+function json(resBody: any, status = 200) {
+  return new Response(JSON.stringify(resBody), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
 }
 
 serve(async (req) => {
-  // ✅ CORS preflight
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
-  }
+  const id = reqId();
+  const startedAt = Date.now();
 
-  if (req.method !== "POST") {
-    return json(405, { error: "METHOD_NOT_ALLOWED" });
-  }
+  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
 
-  const t0 = Date.now();
-  log("BOOT", { BUILD_TAG });
+  const authHeader = req.headers.get("authorization");
+  const apiKeyHeader = req.headers.get("apikey");
+
+  console.log(`[${VERSION}] [${id}] START`, {
+    method: req.method,
+    url: req.url,
+    hasAuthHeader: !!authHeader,
+    authPrefix: safePrefix(authHeader, 18),
+    hasApiKey: !!apiKeyHeader,
+    apikeyPrefix: safePrefix(apiKeyHeader, 16),
+  });
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const anonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY");
+    const publishableKey = Deno.env.get("SUPABASE_PUBLISHABLE_KEY");
 
-    if (!supabaseUrl || !anonKey || !serviceKey) {
-      return json(500, {
-        error: "MISSING_ENV_VARS",
-        required: ["SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
-      });
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error(`[${VERSION}] [${id}] ENV_MISSING`, { hasUrl: !!supabaseUrl, hasServiceRole: !!serviceRoleKey });
+      return json({ error: "Server misconfigured", details: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY", reqId: id, version: VERSION }, 500);
     }
 
-    const authHeader =
-      req.headers.get("authorization") ??
-      req.headers.get("Authorization") ??
-      "";
-
-    // ✅ soporta Bearer / bearer
-    if (!authHeader.toLowerCase().startsWith("bearer ")) {
-      return json(401, { error: "MISSING_BEARER_TOKEN" });
+    const keyForAuth = anonKey || publishableKey;
+    if (!keyForAuth) {
+      console.error(`[${VERSION}] [${id}] ENV_MISSING_AUTH_KEY`, { hasAnonKey: !!anonKey, hasPublishableKey: !!publishableKey });
+      return json({ error: "Server misconfigured", details: "Missing SUPABASE_ANON_KEY or SUPABASE_PUBLISHABLE_KEY", reqId: id, version: VERSION }, 500);
     }
 
-    const accessToken = authHeader.split(" ")[1];
-
-    const supabaseAuth = createClient(supabaseUrl, anonKey, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false,
-      },
+    const supabaseAuth = createClient(supabaseUrl, keyForAuth, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: { headers: { Authorization: authHeader ?? "" } },
     });
 
-    const { data: authData, error: authError } =
-      await supabaseAuth.auth.getUser(accessToken);
+    const { data: userData, error: userErr } = await supabaseAuth.auth.getUser();
+    const user = userData?.user ?? null;
 
-    if (authError || !authData?.user) {
-      log("INVALID_JWT", authError?.message);
-      return json(401, { error: "INVALID_JWT" });
-    }
-
-    const caller = authData.user;
-    log("AUTHENTICATED", { userId: caller.id });
-
-    const supabaseAdmin = createClient(supabaseUrl, serviceKey, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-        detectSessionInUrl: false,
-      },
+    console.log(`[${VERSION}] [${id}] AUTH_CHECK`, {
+      ok: !!user && !userErr,
+      userId: user?.id ?? null,
+      userEmail: user?.email ?? null,
+      authError: userErr ? { name: userErr.name, message: userErr.message } : null,
     });
 
-    const body = await req.json().catch(() => null);
-    if (!body) return json(400, { error: "INVALID_JSON" });
-
-    const { action, orgId, targetUserId, debug } = body;
-
-    if (!action || !orgId || !targetUserId) {
-      return json(400, {
-        error: "MISSING_FIELDS",
-        required: ["action", "orgId", "targetUserId"],
-      });
+    if (!user) {
+      return json({ error: "Unauthorized", details: "Auth session missing!", reqId: id, version: VERSION }, 401);
     }
 
-    log("REQUEST", { action, orgId, targetUserId, callerId: caller.id });
-
-    // =========================
-    // ✅ PERMISSION CHECK (ajustado a tus permisos reales)
-    // =========================
-    const { data: userOrgRoles, error: uorErr } = await supabaseAdmin
-      .from("user_org_roles")
-      .select("role_id")
-      .eq("user_id", caller.id)
-      .eq("org_id", orgId);
-
-    if (uorErr) {
-      log("ROLE_LOOKUP_FAILED", uorErr.message);
-      return json(500, { error: "ROLE_LOOKUP_FAILED", details: uorErr.message });
-    }
-
-    if (!userOrgRoles || userOrgRoles.length === 0) {
-      log("NO_ROLE_IN_ORG", { userId: caller.id, orgId });
-
-      if (debug) {
-        return json(403, {
-          error: "FORBIDDEN_NOT_ADMIN",
-          debug: {
-            buildTag: BUILD_TAG,
-            requesterUserId: caller.id,
-            orgId,
-            decision: "DENY",
-            reason: "User has no role in organization",
-            ms: Date.now() - t0,
-          },
-        });
-      }
-
-      return json(403, { error: "FORBIDDEN_NOT_ADMIN" });
-    }
-
-    const roleIds = userOrgRoles.map((r: any) => r.role_id);
-    log("USER_ROLES", { roleIds });
-
-    const { data: rolePermissions, error: rpErr } = await supabaseAdmin
-      .from("role_permissions")
-      .select("permission_id, permissions(name)")
-      .in("role_id", roleIds);
-
-    if (rpErr) {
-      log("PERMISSION_LOOKUP_FAILED", rpErr.message);
-      return json(500, { error: "PERMISSION_LOOKUP_FAILED", details: rpErr.message });
-    }
-
-    const permSet = new Set<string>();
-    (rolePermissions ?? []).forEach((x: any) => {
-      const name = x?.permissions?.name;
-      if (name) permSet.add(name);
+    const supabase = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    const permissionsArray = Array.from(permSet);
-    log("USER_PERMISSIONS", { permissions: permissionsArray });
-
-    // ✅ permisos reales esperados
-    const requiredAny = [
-      "admin.users.assign_access",
-      "admin.users.assign_roles",
-      "admin.users.view",
-      "admin.users.update",
-    ];
-
-    const hasPermission = requiredAny.some((perm) => permSet.has(perm));
-
-    if (!hasPermission) {
-      log("PERMISSION_DENIED", { requiredAny, has: permissionsArray });
-
-      if (debug) {
-        return json(403, {
-          error: "FORBIDDEN_NOT_ADMIN",
-          debug: {
-            buildTag: BUILD_TAG,
-            requesterUserId: caller.id,
-            orgId,
-            permissionsChecked: requiredAny,
-            userPermissions: permissionsArray,
-            decision: "DENY",
-            reason: "User lacks required permissions",
-            ms: Date.now() - t0,
-          },
-        });
-      }
-
-      return json(403, { error: "FORBIDDEN_NOT_ADMIN" });
+    let payload: any = null;
+    try {
+      payload = await req.json();
+    } catch {
+      console.error(`[${VERSION}] [${id}] BAD_JSON`);
+      return json({ error: "Bad Request", details: "Invalid JSON body", reqId: id, version: VERSION }, 400);
     }
 
-    log("PERMISSION_GRANTED", {
-      grantedBy: permissionsArray.filter((p) => requiredAny.includes(p)),
+    const { action, userId, targetUserId, orgId, status, rejectionReason, countryIds, warehouseIds, restricted } = payload ?? {};
+
+    // ✅ Soportar tanto userId como targetUserId (fallback)
+    const finalTargetUserId = targetUserId || userId;
+
+    console.log(`[${VERSION}] [${id}] PAYLOAD`, {
+      action,
+      targetUserId: finalTargetUserId ?? null,
+      orgId: orgId ?? null,
+      status: status ?? null,
+      hasRejectionReason: !!rejectionReason,
+      hasCountryIds: Array.isArray(countryIds),
+      countryIdsCount: Array.isArray(countryIds) ? countryIds.length : 0,
+      hasWarehouseIds: Array.isArray(warehouseIds),
+      warehouseIdsCount: Array.isArray(warehouseIds) ? warehouseIds.length : 0,
+      restricted: restricted ?? null,
+      requester: user.id,
     });
 
-    // =========================
-    // ACTION: GET
-    // =========================
+    // ✅ NUEVO: Acción GET - Obtener accesos del usuario
     if (action === "get") {
-      const { data: countries, error: cErr } = await supabaseAdmin
+      if (!orgId) {
+        console.error(`[${VERSION}] [${id}] GET_MISSING_ORG_ID`);
+        return json({ error: "Bad Request", details: "Missing orgId", reqId: id, version: VERSION }, 400);
+      }
+
+      if (!finalTargetUserId) {
+        console.error(`[${VERSION}] [${id}] GET_MISSING_TARGET_USER_ID`);
+        return json({ error: "Bad Request", details: "Missing targetUserId", reqId: id, version: VERSION }, 400);
+      }
+
+      console.log(`[${VERSION}] [${id}] GET_START`, { orgId, targetUserId: finalTargetUserId });
+
+      // Obtener países asignados
+      const { data: countriesData, error: countriesError } = await supabase
         .from("user_country_access")
         .select("country_id")
-        .eq("org_id", orgId)
-        .eq("user_id", targetUserId);
+        .eq("user_id", finalTargetUserId)
+        .eq("org_id", orgId);
 
-      if (cErr) {
-        log("GET_COUNTRIES_FAILED", cErr.message);
-        return json(500, { error: "GET_COUNTRIES_FAILED", details: cErr.message });
+      console.log(`[${VERSION}] [${id}] GET_COUNTRIES`, {
+        ok: !countriesError,
+        count: countriesData?.length ?? 0,
+        error: countriesError ? { message: countriesError.message } : null,
+      });
+
+      if (countriesError) {
+        return json({ error: "Database error", details: countriesError.message, reqId: id, version: VERSION }, 500);
       }
 
-      const { data: warehouses, error: wErr } = await supabaseAdmin
-        .from("user_warehouse_access")
-        .select("warehouse_id")
-        .eq("org_id", orgId)
-        .eq("user_id", targetUserId);
+      const countryIdsResult = (countriesData ?? []).map((row: any) => row.country_id);
 
-      if (wErr) {
-        log("GET_WAREHOUSES_FAILED", wErr.message);
-        return json(500, { error: "GET_WAREHOUSES_FAILED", details: wErr.message });
+      // Obtener almacenes asignados
+      const { data: warehousesData, error: warehousesError } = await supabase
+        .from("user_warehouse_access")
+        .select("warehouse_id, restricted")
+        .eq("user_id", finalTargetUserId)
+        .eq("org_id", orgId)
+        .limit(1);
+
+      console.log(`[${VERSION}] [${id}] GET_WAREHOUSES`, {
+        ok: !warehousesError,
+        count: warehousesData?.length ?? 0,
+        error: warehousesError ? { message: warehousesError.message } : null,
+      });
+
+      if (warehousesError) {
+        return json({ error: "Database error", details: warehousesError.message, reqId: id, version: VERSION }, 500);
+      }
+
+      const restrictedValue = warehousesData?.[0]?.restricted ?? false;
+
+      // Si está restringido, obtener los IDs de almacenes
+      let warehouseIdsResult: string[] = [];
+      if (restrictedValue) {
+        const { data: whIds, error: whIdsError } = await supabase
+          .from("user_warehouse_access")
+          .select("warehouse_id")
+          .eq("user_id", finalTargetUserId)
+          .eq("org_id", orgId);
+
+        if (whIdsError) {
+          console.error(`[${VERSION}] [${id}] GET_WAREHOUSE_IDS_ERROR`, { message: whIdsError.message });
+        } else {
+          warehouseIdsResult = (whIds ?? []).map((row: any) => row.warehouse_id);
+        }
       }
 
       const result = {
-        countryIds: (countries ?? []).map((c: any) => c.country_id),
-        warehouseIds: (warehouses ?? []).map((w: any) => w.warehouse_id),
-        restricted: (warehouses ?? []).length > 0,
+        countryIds: countryIdsResult,
+        warehouseIds: warehouseIdsResult,
+        restricted: restrictedValue,
       };
 
-      log("GET_SUCCESS", {
-        targetUserId,
-        countriesCount: result.countryIds.length,
-        warehousesCount: result.warehouseIds.length,
-        ms: Date.now() - t0,
-      });
+      console.log(`[${VERSION}] [${id}] GET_SUCCESS`, result);
 
-      if (debug) {
-        return json(200, {
-          ...result,
-          debug: {
-            buildTag: BUILD_TAG,
-            requesterUserId: caller.id,
-            orgId,
-            decision: "ALLOW",
-            ms: Date.now() - t0,
-          },
-        });
-      }
-
-      return json(200, result);
+      return json(result, 200);
     }
 
-    // =========================
-    // ACTION: SET_COUNTRIES
-    // =========================
+    // ✅ NUEVO: Acción SET_COUNTRIES - Asignar países
     if (action === "set_countries") {
-      const countryIds: string[] = Array.isArray(body.countryIds) ? body.countryIds : [];
+      if (!orgId) {
+        console.error(`[${VERSION}] [${id}] SET_COUNTRIES_MISSING_ORG_ID`);
+        return json({ error: "Bad Request", details: "Missing orgId", reqId: id, version: VERSION }, 400);
+      }
 
-      log("SET_COUNTRIES_START", { targetUserId, countryIds });
+      if (!finalTargetUserId) {
+        console.error(`[${VERSION}] [${id}] SET_COUNTRIES_MISSING_TARGET_USER_ID`);
+        return json({ error: "Bad Request", details: "Missing targetUserId", reqId: id, version: VERSION }, 400);
+      }
 
-      const { error: delErr } = await supabaseAdmin
+      if (!Array.isArray(countryIds)) {
+        console.error(`[${VERSION}] [${id}] SET_COUNTRIES_INVALID_COUNTRY_IDS`);
+        return json({ error: "Bad Request", details: "countryIds must be an array", reqId: id, version: VERSION }, 400);
+      }
+
+      console.log(`[${VERSION}] [${id}] SET_COUNTRIES_START`, {
+        orgId,
+        targetUserId: finalTargetUserId,
+        countryIds,
+      });
+
+      // Eliminar países existentes
+      const { error: deleteError } = await supabase
         .from("user_country_access")
         .delete()
-        .eq("org_id", orgId)
-        .eq("user_id", targetUserId);
+        .eq("user_id", finalTargetUserId)
+        .eq("org_id", orgId);
 
-      if (delErr) {
-        log("DELETE_COUNTRIES_FAILED", delErr.message);
-        return json(500, { error: "DELETE_COUNTRIES_FAILED", details: delErr.message });
+      if (deleteError) {
+        console.error(`[${VERSION}] [${id}] SET_COUNTRIES_DELETE_ERROR`, { message: deleteError.message });
+        return json({ error: "Database error", details: deleteError.message, reqId: id, version: VERSION }, 500);
       }
 
-      if (countryIds.length) {
-        const { error: insErr } = await supabaseAdmin
+      // Insertar nuevos países
+      if (countryIds.length > 0) {
+        const rows = countryIds.map((countryId: string) => ({
+          user_id: finalTargetUserId,
+          org_id: orgId,
+          country_id: countryId,
+        }));
+
+        const { error: insertError } = await supabase
           .from("user_country_access")
-          .insert(
-            countryIds.map((id) => ({
-              org_id: orgId,
-              user_id: targetUserId,
-              country_id: id,
-            }))
-          );
+          .insert(rows);
 
-        if (insErr) {
-          log("INSERT_COUNTRIES_FAILED", {
-            message: insErr.message,
-            code: (insErr as any).code,
-            hint: (insErr as any).hint,
-            details: (insErr as any).details,
-          });
-
-          return json(500, {
-            error: "INSERT_COUNTRIES_FAILED",
-            message: insErr.message,
-            code: (insErr as any).code,
-            hint: (insErr as any).hint,
-            details: (insErr as any).details,
-          });
+        if (insertError) {
+          console.error(`[${VERSION}] [${id}] SET_COUNTRIES_INSERT_ERROR`, { message: insertError.message });
+          return json({ error: "Database error", details: insertError.message, reqId: id, version: VERSION }, 500);
         }
       }
 
-      // UI/Regla: si cambian países, limpiamos warehouses
-      const { error: delWhErr } = await supabaseAdmin
-        .from("user_warehouse_access")
-        .delete()
-        .eq("org_id", orgId)
-        .eq("user_id", targetUserId);
+      console.log(`[${VERSION}] [${id}] SET_COUNTRIES_SUCCESS`, { count: countryIds.length });
 
-      if (delWhErr) {
-        log("DELETE_WAREHOUSES_FAILED", delWhErr.message);
-        return json(500, { error: "DELETE_WAREHOUSES_FAILED", details: delWhErr.message });
-      }
-
-      log("SET_COUNTRIES_SUCCESS", {
-        targetUserId,
-        countriesCount: countryIds.length,
-        ms: Date.now() - t0,
-      });
-
-      return json(200, { success: true });
+      return json({ success: true, message: "Countries assigned", reqId: id, version: VERSION }, 200);
     }
 
-    // =========================
-    // ACTION: SET_WAREHOUSES
-    // =========================
+    // ✅ NUEVO: Acción SET_WAREHOUSES - Asignar almacenes
     if (action === "set_warehouses") {
-      const restricted = Boolean(body.restricted);
-      const warehouseIds: string[] = Array.isArray(body.warehouseIds) ? body.warehouseIds : [];
-
-      log("SET_WAREHOUSES_START", { targetUserId, restricted, warehouseIds });
-
-      const { error: delErr } = await supabaseAdmin
-        .from("user_warehouse_access")
-        .delete()
-        .eq("org_id", orgId)
-        .eq("user_id", targetUserId);
-
-      if (delErr) {
-        log("DELETE_WAREHOUSES_FAILED", delErr.message);
-        return json(500, { error: "DELETE_WAREHOUSES_FAILED", details: delErr.message });
+      if (!orgId) {
+        console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_MISSING_ORG_ID`);
+        return json({ error: "Bad Request", details: "Missing orgId", reqId: id, version: VERSION }, 400);
       }
 
-      if (restricted && warehouseIds.length) {
-        const { error: insErr } = await supabaseAdmin
+      if (!finalTargetUserId) {
+        console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_MISSING_TARGET_USER_ID`);
+        return json({ error: "Bad Request", details: "Missing targetUserId", reqId: id, version: VERSION }, 400);
+      }
+
+      if (typeof restricted !== "boolean") {
+        console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_INVALID_RESTRICTED`);
+        return json({ error: "Bad Request", details: "restricted must be a boolean", reqId: id, version: VERSION }, 400);
+      }
+
+      if (!Array.isArray(warehouseIds)) {
+        console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_INVALID_WAREHOUSE_IDS`);
+        return json({ error: "Bad Request", details: "warehouseIds must be an array", reqId: id, version: VERSION }, 400);
+      }
+
+      console.log(`[${VERSION}] [${id}] SET_WAREHOUSES_START`, {
+        orgId,
+        targetUserId: finalTargetUserId,
+        restricted,
+        warehouseIds,
+      });
+
+      // Eliminar almacenes existentes
+      const { error: deleteError } = await supabase
+        .from("user_warehouse_access")
+        .delete()
+        .eq("user_id", finalTargetUserId)
+        .eq("org_id", orgId);
+
+      if (deleteError) {
+        console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_DELETE_ERROR`, { message: deleteError.message });
+        return json({ error: "Database error", details: deleteError.message, reqId: id, version: VERSION }, 500);
+      }
+
+      // Insertar nuevos almacenes
+      if (restricted && warehouseIds.length > 0) {
+        const rows = warehouseIds.map((warehouseId: string) => ({
+          user_id: finalTargetUserId,
+          org_id: orgId,
+          warehouse_id: warehouseId,
+          restricted: true,
+        }));
+
+        const { error: insertError } = await supabase
           .from("user_warehouse_access")
-          .insert(
-            warehouseIds.map((id) => ({
-              org_id: orgId,
-              user_id: targetUserId,
-              warehouse_id: id,
-            }))
-          );
+          .insert(rows);
 
-        if (insErr) {
-          log("INSERT_WAREHOUSES_FAILED", {
-            message: insErr.message,
-            code: (insErr as any).code,
-            hint: (insErr as any).hint,
-            details: (insErr as any).details,
+        if (insertError) {
+          console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_INSERT_ERROR`, { message: insertError.message });
+          return json({ error: "Database error", details: insertError.message, reqId: id, version: VERSION }, 500);
+        }
+      } else if (!restricted) {
+        // Insertar un registro con restricted=false (sin warehouse_id específico)
+        const { error: insertError } = await supabase
+          .from("user_warehouse_access")
+          .insert({
+            user_id: finalTargetUserId,
+            org_id: orgId,
+            warehouse_id: null,
+            restricted: false,
           });
 
-          return json(500, {
-            error: "INSERT_WAREHOUSES_FAILED",
-            message: insErr.message,
-            code: (insErr as any).code,
-            hint: (insErr as any).hint,
-            details: (insErr as any).details,
-          });
+        if (insertError) {
+          console.error(`[${VERSION}] [${id}] SET_WAREHOUSES_INSERT_UNRESTRICTED_ERROR`, { message: insertError.message });
+          return json({ error: "Database error", details: insertError.message, reqId: id, version: VERSION }, 500);
         }
       }
 
-      log("SET_WAREHOUSES_SUCCESS", {
-        targetUserId,
-        restricted,
-        warehousesCount: restricted ? warehouseIds.length : 0,
-        ms: Date.now() - t0,
-      });
+      console.log(`[${VERSION}] [${id}] SET_WAREHOUSES_SUCCESS`, { restricted, count: warehouseIds.length });
 
-      return json(200, { success: true });
+      return json({ success: true, message: "Warehouses assigned", reqId: id, version: VERSION }, 200);
     }
 
-    return json(400, { error: "UNKNOWN_ACTION", action });
+    // ✅ Acciones legacy (approve, reject, update_status)
+    if (!finalTargetUserId) {
+      return json({ error: "Bad Request", details: "Missing userId or targetUserId", reqId: id, version: VERSION }, 400);
+    }
+
+    if (action === "approve") {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ access_status: "approved", access_approved_at: new Date().toISOString() })
+        .eq("id", finalTargetUserId);
+
+      console.log(`[${VERSION}] [${id}] APPROVE`, {
+        ok: !error,
+        targetUserId: finalTargetUserId,
+        error: error ? { message: error.message, name: error.name } : null,
+      });
+
+      if (error) return json({ error: "Update failed", details: error.message, reqId: id, version: VERSION }, 500);
+
+      return json({ success: true, message: "User approved", reqId: id, version: VERSION }, 200);
+    }
+
+    if (action === "reject") {
+      const { error } = await supabase
+        .from("profiles")
+        .update({
+          access_status: "rejected",
+          rejection_reason: rejectionReason || "No reason provided",
+        })
+        .eq("id", finalTargetUserId);
+
+      console.log(`[${VERSION}] [${id}] REJECT`, {
+        ok: !error,
+        targetUserId: finalTargetUserId,
+        error: error ? { message: error.message, name: error.name } : null,
+      });
+
+      if (error) return json({ error: "Update failed", details: error.message, reqId: id, version: VERSION }, 500);
+
+      return json({ success: true, message: "User rejected", reqId: id, version: VERSION }, 200);
+    }
+
+    if (action === "update_status") {
+      if (!status) return json({ error: "Bad Request", details: "Missing status", reqId: id, version: VERSION }, 400);
+
+      const { error } = await supabase
+        .from("profiles")
+        .update({ access_status: status })
+        .eq("id", finalTargetUserId);
+
+      console.log(`[${VERSION}] [${id}] UPDATE_STATUS`, {
+        ok: !error,
+        targetUserId: finalTargetUserId,
+        status,
+        error: error ? { message: error.message, name: error.name } : null,
+      });
+
+      if (error) return json({ error: "Update failed", details: error.message, reqId: id, version: VERSION }, 500);
+
+      return json({ success: true, message: "Status updated", reqId: id, version: VERSION }, 200);
+    }
+
+    return json({ error: "Invalid action", reqId: id, version: VERSION }, 400);
   } catch (e: any) {
-    console.error("[admin-user-access] FATAL", e);
-    return json(500, { error: "INTERNAL_ERROR", details: String(e?.message ?? e) });
+    console.error(`[${VERSION}] [${id}] UNHANDLED`, { message: e?.message ?? String(e) });
+    return json({ error: "Server error", details: e?.message ?? String(e), reqId: id, version: VERSION }, 500);
+  } finally {
+    console.log(`[${VERSION}] [${id}] END`, { ms: Date.now() - startedAt });
   }
 });

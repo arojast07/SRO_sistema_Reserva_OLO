@@ -1,4 +1,3 @@
-
 import { supabase } from '../lib/supabase';
 import { startOfMonth, endOfMonth, startOfWeek, endOfWeek, subMonths, subWeeks, format, eachDayOfInterval, startOfDay, endOfDay } from 'date-fns';
 
@@ -119,8 +118,15 @@ export const dashboardService = {
       .eq('org_id', orgId)
       .eq('is_active', true);
 
+    // Obtener proveedores
+    const { data: providers } = await supabase
+      .from('providers')
+      .select('id, name')
+      .eq('org_id', orgId);
+
     const allReservations = reservations || [];
     const statusMap = new Map(statuses?.map(s => [s.id, s]) || []);
+    const providerMap = new Map(providers?.map(p => [p.id, p.name]) || []);
 
     // Filtrar por período
     const todayReservations = allReservations.filter(r => {
@@ -155,11 +161,13 @@ export const dashboardService = {
     const inProgressCount = statusDistribution.find(s => s.code === 'IN_PROGRESS')?.count || 0;
     const completedCount = statusDistribution.find(s => s.code === 'DONE')?.count || 0;
 
-    // Top proveedores
+    // Top proveedores - Resolver nombres
     const providerCounts: Record<string, number> = {};
     allReservations.forEach(r => {
       if (r.shipper_provider) {
-        providerCounts[r.shipper_provider] = (providerCounts[r.shipper_provider] || 0) + 1;
+        // Si es un UUID, buscar el nombre en el mapa
+        const providerName = providerMap.get(r.shipper_provider) || r.shipper_provider;
+        providerCounts[providerName] = (providerCounts[providerName] || 0) + 1;
       }
     });
     const topProviders = Object.entries(providerCounts)

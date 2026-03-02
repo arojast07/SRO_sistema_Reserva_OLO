@@ -5,6 +5,10 @@ import { usePermissions } from '../../../hooks/usePermissions';
 import { countriesService } from '../../../services/countriesService';
 import { warehousesService } from '../../../services/warehousesService';
 import { userAccessService } from '../../../services/userAccessService';
+import { providersService } from '../../../services/providersService';
+import { userProvidersService } from '../../../services/userProvidersService';
+import { ConfirmModal } from '../../../components/base/ConfirmModal';
+import type { Provider } from '../../../types/catalog';
 
 interface User {
   id: string;
@@ -14,6 +18,7 @@ interface User {
   role_id: string;
   created_at: string;
   last_sign_in_at: string;
+  phone_e164?: string | null;
 }
 
 interface Role {
@@ -48,7 +53,8 @@ export default function UsuariosPage() {
     email: '',
     full_name: '',
     role_id: '',
-    password: ''
+    password: '',
+    phone_e164: ''
   });
 
   // Estados para control de acceso
@@ -57,6 +63,38 @@ export default function UsuariosPage() {
   const [selectedWarehouseIds, setSelectedWarehouseIds] = useState<string[]>([]);
   const [accessLoading, setAccessLoading] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
+
+  // ✅ NUEVO: Estados para proveedores
+  const [providers, setProviders] = useState<Provider[]>([]);
+  const [selectedProviderIds, setSelectedProviderIds] = useState<string[]>([]);
+  const [providerSearchTerm, setProviderSearchTerm] = useState('');
+  const [providersLoading, setProvidersLoading] = useState(false);
+
+  // ✅ NUEVO: Estados para popups y confirmaciones
+  const [popup, setPopup] = useState<{
+    isOpen: boolean;
+    type: 'success' | 'error' | 'warning' | 'info';
+    title: string;
+    message: string;
+    showCancel: boolean;
+    onConfirm?: () => void;
+  }>({
+    isOpen: false,
+    type: 'info',
+    title: '',
+    message: '',
+    showCancel: false,
+  });
+
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    isOpen: boolean;
+    userId: string;
+    userName: string;
+  }>({
+    isOpen: false,
+    userId: '',
+    userName: '',
+  });
 
   // ✅ guards reales (no se resetean por render)
   const loadUsersRunningRef = useRef(false);
@@ -198,17 +236,24 @@ export default function UsuariosPage() {
 
   const loadRoles = useCallback(async () => {
     try {
+      console.log('[UsersPage] 🔄 Loading roles...');
+      
       const { data, error } = await supabase
         .from('roles')
         .select('id, name')
         .order('name');
 
-      if (error) throw error;
+      if (error) {
+        console.error('[UsersPage] ❌ Error loading roles:', error);
+        throw error;
+      }
+      
       const safeRoles = data ?? [];
-      console.log('[UsersPage] roles loaded', { count: safeRoles.length });
+      console.log('[UsersPage] ✅ Roles loaded', { count: safeRoles.length, roles: safeRoles });
       setRoles(safeRoles);
     } catch (error) {
-      console.error('[UsersPage] Error loading roles:', error);
+      console.error('[UsersPage] ❌ Error loading roles:', error);
+      setRoles([]); // Asegurar que roles sea un array vacío en caso de error
     }
   }, []);
 
@@ -216,37 +261,98 @@ export default function UsuariosPage() {
     if (!orgId) return;
 
     try {
+      console.log('[UsersPage] 🔄 Loading countries and warehouses...');
+      
       const [countriesData, warehousesData] = await Promise.all([
         countriesService.getActive(orgId),
         warehousesService.getAll(orgId)
       ]);
 
+      console.log('[UsersPage] ✅ Countries and warehouses loaded', {
+        countriesCount: countriesData.length,
+        warehousesCount: warehousesData.length,
+      });
+
       setCountries(countriesData);
       setWarehouses(warehousesData);
     } catch (error) {
-      console.error('[UsersPage] Error loading countries/warehouses:', error);
+      console.error('[UsersPage] ❌ Error loading countries/warehouses:', error);
+    }
+  }, [orgId]);
+
+  // ✅ NUEVO: Cargar proveedores
+  const loadProviders = useCallback(async () => {
+    if (!orgId) return;
+
+    try {
+      console.log('[UsersPage] 🔄 Loading providers...');
+      setProvidersLoading(true);
+      
+      const providersData = await providersService.getActive(orgId);
+      
+      console.log('[UsersPage] ✅ Providers loaded', { count: providersData.length });
+      setProviders(providersData);
+    } catch (error) {
+      console.error('[UsersPage] ❌ Error loading providers:', error);
+    } finally {
+      setProvidersLoading(false);
     }
   }, [orgId]);
 
   const loadUserAccess = useCallback(async (targetUserId: string) => {
-    if (!orgId || !targetUserId) return;
+    if (!orgId || !targetUserId) {
+      console.warn('[UsersPage] loadUserAccess skipped: missing orgId or targetUserId', { orgId, targetUserId });
+      return;
+    }
 
     setAccessLoading(true);
     setAccessError(null);
 
     try {
+      console.log('[UsersPage] 🔄 Loading user access...', { orgId, targetUserId });
+      
       // ✅ CAMBIO: asegurar sesión antes de invocar
       await ensureSession();
 
       const accessData = await userAccessService.get(orgId, targetUserId);
+      
       setSelectedCountryIds(accessData.countryIds);
       setRestrictedByWarehouse(accessData.restricted);
       setSelectedWarehouseIds(accessData.warehouseIds);
 
-      console.log('[UsersPage] User access loaded:', accessData);
+      console.log('[UsersPage] ✅ User access loaded:', accessData);
+
+      // ✅ CORREGIDO: Cargar proveedores asignados y mapear a IDs
+      try {
+        const userProviders = await userProvidersService.getUserProviders(orgId, targetUserId);
+        
+        // ✅ CORREGIDO: getUserProviders devuelve UserProvider[] con { id, name }
+        // Necesitamos extraer solo los IDs para selectedProviderIds
+        const providerIds = userProviders.map(up => up.id);
+        
+        setSelectedProviderIds(providerIds);
+        
+        console.log('[UsersPage] ✅ User providers loaded:', { 
+          count: userProviders.length,
+          selectedProviderIdsCount: providerIds.length,
+          providerIds: providerIds,
+          providerNames: userProviders.map(up => up.name)
+        });
+      } catch (providerError) {
+        console.error('[UsersPage] ⚠️ Error loading user providers (non-blocking):', providerError);
+        setSelectedProviderIds([]);
+      }
     } catch (error) {
-      console.error('[UsersPage] Error loading user access:', error);
-      setAccessError(error instanceof Error ? error.message : 'Error al cargar accesos');
+      console.error('[UsersPage] ❌ Error loading user access:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Error al cargar accesos';
+      setAccessError(errorMessage);
+      
+      // ✅ NUEVO: Mostrar error en UI pero no romper el modal
+      console.warn('[UsersPage] ⚠️ Continuing with empty access data');
+      setSelectedCountryIds([]);
+      setRestrictedByWarehouse(false);
+      setSelectedWarehouseIds([]);
+      setSelectedProviderIds([]);
     } finally {
       setAccessLoading(false);
     }
@@ -264,10 +370,11 @@ export default function UsuariosPage() {
       loadUsers();
       loadRoles();
       loadCountriesAndWarehouses();
+      loadProviders(); // ✅ NUEVO
     };
 
     run();
-  }, [permissionsLoading, orgId, loadUsers, loadRoles, loadCountriesAndWarehouses]);
+  }, [permissionsLoading, orgId, loadUsers, loadRoles, loadCountriesAndWarehouses, loadProviders]);
 
   useEffect(() => {
     console.log('[UsersPage] button permissions (final render)', {
@@ -291,6 +398,8 @@ export default function UsuariosPage() {
     try {
       await ensureSession();
 
+      const phoneE164 = formData.phone_e164?.trim() || null;
+
       if (editingUser) {
         console.log('[UsersPage] 🔄 Updating user via admin-users function');
 
@@ -302,6 +411,7 @@ export default function UsuariosPage() {
             userId: editingUser.id,
             email: formData.email,
             full_name: formData.full_name,
+            phone_e164: phoneE164,
             roleIds: formData.role_id ? [formData.role_id] : [],
             orgId
           },
@@ -314,7 +424,7 @@ export default function UsuariosPage() {
 
         console.log('[UsersPage] ✅ User updated successfully', { ok: !!data });
 
-        // ✅ Sincronizar países y almacenes al actualizar
+        // ✅ Sincronizar países, almacenes y proveedores al actualizar
         if (canAssignAccess && orgId) {
           // Guardar países
           if (selectedCountryIds.length > 0) {
@@ -335,17 +445,33 @@ export default function UsuariosPage() {
             restricted,
             warehouseIds,
           });
+
+          // ✅ NUEVO: Guardar proveedores
+          await userProvidersService.setUserProviders(orgId, editingUser.id, selectedProviderIds);
+          console.log('[UsersPage] ✅ User providers saved');
         }
 
         setShowModal(false);
         setEditingUser(null);
-        setFormData({ email: '', full_name: '', role_id: '', password: '' });
+        setFormData({ email: '', full_name: '', role_id: '', password: '', phone_e164: '' });
         setSelectedCountryIds([]);
         setRestrictedByWarehouse(false);
         setSelectedWarehouseIds([]);
+        setSelectedProviderIds([]); // ✅ NUEVO
+        setProviderSearchTerm(''); // ✅ NUEVO
         setNewlyCreatedUserId(null);
         loadUsers401RetryRef.current = false;
         loadUsers();
+
+        // ✅ Mostrar popup de éxito
+        setPopup({
+          isOpen: true,
+          type: 'success',
+          title: 'Usuario actualizado',
+          message: 'Los datos del usuario se han actualizado correctamente.',
+          showCancel: false,
+          onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+        });
       } else {
         console.log('[UsersPage] ➕ Creating user via admin-users function');
 
@@ -355,6 +481,7 @@ export default function UsuariosPage() {
             roleId: formData.role_id,
             email: formData.email,
             password: formData.password,
+            phone_e164: phoneE164,
             roleIds: formData.role_id ? [formData.role_id] : [],
             orgId
           },
@@ -385,11 +512,25 @@ export default function UsuariosPage() {
         // Caso duplicado (tu edge function responde 409 con error=DUPLICATE_EMAIL o EMAIL_CONFLICT_IN_PROFILES)
         const serverCode = server?.error;
         if (serverCode === 'DUPLICATE_EMAIL') {
-          alert('Ese email ya está registrado. Usá otro email o editá el usuario existente.');
+          setPopup({
+            isOpen: true,
+            type: 'warning',
+            title: 'Email duplicado',
+            message: 'Ese email ya está registrado. Usá otro email o editá el usuario existente.',
+            showCancel: false,
+            onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+          });
           return;
         }
         if (serverCode === 'EMAIL_CONFLICT_IN_PROFILES' || serverCode === 'EMAIL_ALREADY_USED') {
-          alert('Ese email ya está en uso por otro perfil. Revisá la tabla profiles.');
+          setPopup({
+            isOpen: true,
+            type: 'warning',
+            title: 'Email en uso',
+            message: 'Ese email ya está en uso por otro perfil. Revisá la tabla profiles.',
+            showCancel: false,
+            onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+          });
           return;
         }
 
@@ -419,7 +560,7 @@ export default function UsuariosPage() {
 
         console.log('[UsersPage] 📝 Usuario creado con ID:', createdUserId);
 
-        // ✅ NUEVO: Asignar países y almacenes si se seleccionaron
+        // ✅ NUEVO: Asignar países, almacenes y proveedores si se seleccionaron
         if (canAssignAccess && orgId) {
           // Guardar países si hay seleccionados
           if (selectedCountryIds.length > 0) {
@@ -449,41 +590,83 @@ export default function UsuariosPage() {
               warehouseIds: [],
             });
           }
+
+          // ✅ NUEVO: Guardar proveedores si hay seleccionados
+          if (selectedProviderIds.length > 0) {
+            console.log('[UsersPage] 🚚 Asignando proveedores al nuevo usuario...');
+            await userProvidersService.setUserProviders(orgId, createdUserId, selectedProviderIds);
+          }
         }
 
         setShowModal(false);
         setEditingUser(null);
-        setFormData({ email: '', full_name: '', role_id: '', password: '' });
+        setFormData({ email: '', full_name: '', role_id: '', password: '', phone_e164: '' });
         setSelectedCountryIds([]);
         setRestrictedByWarehouse(false);
         setSelectedWarehouseIds([]);
+        setSelectedProviderIds([]); // ✅ NUEVO
+        setProviderSearchTerm(''); // ✅ NUEVO
         setNewlyCreatedUserId(null);
         loadUsers401RetryRef.current = false;
         loadUsers();
+
+        // ✅ Mostrar popup de éxito
+        setPopup({
+          isOpen: true,
+          type: 'success',
+          title: 'Usuario creado',
+          message: 'El usuario se ha creado correctamente.',
+          showCancel: false,
+          onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+        });
       }
     } catch (error: any) {
       console.error('[UsersPage] ❌ Error saving user:', error);
-      alert(error?.message || 'Error al guardar el usuario');
+      setPopup({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: error?.message || 'Error al guardar el usuario',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
     }
   };
 
   const handleEdit = async (user: User) => {
+    console.log('[UsersPage] 🔄 Opening edit modal for user:', { userId: user.id, email: user.email });
+    
     setEditingUser(user);
     setFormData({
       email: user.email,
       full_name: user.full_name,
       role_id: user.role_id || '',
-      password: ''
+      password: '',
+      phone_e164: user.phone_e164 ?? ''
     });
+    
+    // ✅ CORREGIDO: Primero mostrar el modal, luego cargar accesos
     setShowModal(true);
 
+    // ✅ Cargar accesos después de mostrar el modal (sin race condition)
     if (canAssignAccess) {
       await loadUserAccess(user.id);
     }
   };
 
   const handleDelete = async (targetUserId: string) => {
-    if (!confirm('¿Estás seguro de eliminar este usuario?')) return;
+    // ✅ Buscar el usuario para mostrar su nombre en el popup
+    const userToDelete = users.find(u => u.id === targetUserId);
+    setDeleteConfirm({
+      isOpen: true,
+      userId: targetUserId,
+      userName: userToDelete?.full_name || userToDelete?.email || 'este usuario'
+    });
+  };
+
+  const confirmDelete = async () => {
+    const targetUserId = deleteConfirm.userId;
+    setDeleteConfirm({ isOpen: false, userId: '', userName: '' });
 
     try {
       console.log('[UsersPage] 🗑️ Deleting user via admin-users function');
@@ -506,9 +689,26 @@ export default function UsuariosPage() {
       console.log('[UsersPage] ✅ User deleted successfully', { ok: !!data });
       loadUsers401RetryRef.current = false;
       loadUsers();
+
+      // ✅ Mostrar popup de éxito
+      setPopup({
+        isOpen: true,
+        type: 'success',
+        title: 'Usuario eliminado',
+        message: 'El usuario ha sido eliminado de la organización.',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
     } catch (error: any) {
       console.error('[UsersPage] ❌ Error deleting user:', error);
-      alert(error?.message || 'Error al eliminar el usuario');
+      setPopup({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: error?.message || 'Error al eliminar el usuario',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
     }
   };
 
@@ -530,12 +730,27 @@ export default function UsuariosPage() {
       setRestrictedByWarehouse(false);
       setSelectedWarehouseIds([]);
 
-      alert('Países asignados correctamente');
+      // ✅ Popup de éxito
+      setPopup({
+        isOpen: true,
+        type: 'success',
+        title: 'Países asignados',
+        message: 'Los países han sido asignados correctamente.',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
       console.log('[UsersPage] ✅ Countries saved successfully');
     } catch (error) {
       console.error('[UsersPage] ❌ Error saving countries:', error);
       setAccessError(error instanceof Error ? error.message : 'Error al guardar países');
-      alert(error instanceof Error ? error.message : 'Error al guardar países');
+      setPopup({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: error instanceof Error ? error.message : 'Error al guardar países',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
     } finally {
       setAccessLoading(false);
     }
@@ -564,12 +779,27 @@ export default function UsuariosPage() {
         warehouseIds: restrictedByWarehouse ? selectedWarehouseIds : []
       });
 
-      alert('Acceso a almacenes actualizado correctamente');
+      // ✅ Popup de éxito
+      setPopup({
+        isOpen: true,
+        type: 'success',
+        title: 'Almacenes actualizados',
+        message: 'El acceso a almacenes ha sido actualizado correctamente.',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
       console.log('[UsersPage] ✅ Warehouses saved successfully');
     } catch (error) {
       console.error('[UsersPage] ❌ Error saving warehouses:', error);
       setAccessError(error instanceof Error ? error.message : 'Error al guardar almacenes');
-      alert(error instanceof Error ? error.message : 'Error al guardar almacenes');
+      setPopup({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: error instanceof Error ? error.message : 'Error al guardar almacenes',
+        showCancel: false,
+        onConfirm: () => setPopup(prev => ({ ...prev, isOpen: false }))
+      });
     } finally {
       setAccessLoading(false);
     }
@@ -627,6 +857,17 @@ export default function UsuariosPage() {
     }
   };
 
+  // ✅ NUEVO: Handlers para proveedores
+  const handleToggleProvider = (providerId: string) => {
+    setSelectedProviderIds(prev => {
+      if (prev.includes(providerId)) {
+        return prev.filter(id => id !== providerId);
+      } else {
+        return [...prev, providerId];
+      }
+    });
+  };
+
   const filteredWarehouses = warehouses.filter(w =>
     selectedCountryIds.includes(w.country_id)
   );
@@ -663,8 +904,37 @@ export default function UsuariosPage() {
     );
   }
 
+  // ✅ NUEVO: Filtrar proveedores por búsqueda
+  const filteredProviders = providers.filter(p =>
+    p.name.toLowerCase().includes(providerSearchTerm.toLowerCase())
+  );
+
   return (
     <div className="p-6">
+      {/* ✅ Popup general para mensajes */}
+      <ConfirmModal
+        isOpen={popup.isOpen}
+        type={popup.type}
+        title={popup.title}
+        message={popup.message}
+        showCancel={popup.showCancel}
+        onConfirm={popup.onConfirm || (() => setPopup(prev => ({ ...prev, isOpen: false })))}
+        onCancel={() => setPopup(prev => ({ ...prev, isOpen: false }))}
+      />
+
+      {/* ✅ Popup de confirmación de eliminación */}
+      <ConfirmModal
+        isOpen={deleteConfirm.isOpen}
+        type="warning"
+        title="Eliminar usuario"
+        message={`¿Estás seguro de eliminar a "${deleteConfirm.userName}"? Esta acción no se puede deshacer.`}
+        confirmText="Eliminar"
+        cancelText="Cancelar"
+        showCancel={true}
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteConfirm({ isOpen: false, userId: '', userName: '' })}
+      />
+
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Gestión de Usuarios</h1>
@@ -674,7 +944,7 @@ export default function UsuariosPage() {
           <button
             onClick={() => {
               setEditingUser(null);
-              setFormData({ email: '', full_name: '', role_id: '', password: '' });
+              setFormData({ email: '', full_name: '', role_id: '', password: '', phone_e164: '' });
               setSelectedCountryIds([]);
               setRestrictedByWarehouse(false);
               setSelectedWarehouseIds([]);
@@ -740,11 +1010,14 @@ export default function UsuariosPage() {
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                    {user.email}
+                    <div>{user.email}</div>
+                    {user.phone_e164 && (
+                      <div className="text-xs text-gray-400">{user.phone_e164}</div>
+                    )}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <span className="px-3 py-1 text-xs font-medium rounded-full bg-blue-100 text-blue-700">
-                      {user.role_name}
+                      {user.role_name || 'Sin rol'}
                     </span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
@@ -837,6 +1110,20 @@ export default function UsuariosPage() {
                   />
                 </div>
 
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Teléfono (opcional)
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.phone_e164}
+                    onChange={(e) => setFormData({ ...formData, phone_e164: e.target.value })}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent"
+                    placeholder="Ej: +50688887777"
+                    disabled={false}
+                  />
+                </div>
+
                 {!editingUser && (
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -874,6 +1161,10 @@ export default function UsuariosPage() {
                   {!canAssign && (
                     <p className="text-xs text-gray-500 mt-1">No tienes permiso para asignar roles</p>
                   )}
+                  {/* ✅ NUEVO: Mostrar advertencia si no hay roles */}
+                  {roles.length === 0 && (
+                    <p className="text-xs text-yellow-600 mt-1">⚠️ No hay roles disponibles. Creá roles primero en la sección de Roles.</p>
+                  )}
                 </div>
               </div>
 
@@ -897,6 +1188,7 @@ export default function UsuariosPage() {
                 {accessError && (
                   <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
                     <p className="text-sm text-red-600">{accessError}</p>
+                    <p className="text-xs text-red-500 mt-1">Podés continuar editando el usuario. Los accesos se pueden configurar después.</p>
                   </div>
                 )}
 
@@ -1021,16 +1313,113 @@ export default function UsuariosPage() {
                 )}
               </div>
 
+              {/* ✅ NUEVO: Sección de Proveedores Asignados */}
+              {canAssignAccess && (
+                <div className="space-y-4 border-t border-gray-200 pt-6">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold text-gray-900">Proveedores Asignados</h3>
+                    {providersLoading && (
+                      <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-teal-600"></div>
+                    )}
+                  </div>
+
+                  <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                    <div className="flex items-start gap-2">
+                      <i className="ri-information-line text-blue-600 text-lg mt-0.5"></i>
+                      <p className="text-sm text-blue-800">
+                        Seleccioná los proveedores que este usuario podrá gestionar. Si no seleccionás ninguno, el usuario tendrá acceso a todos los proveedores.
+                      </p>
+                    </div>
+                  </div>
+
+                  {providers.length === 0 ? (
+                    <div className="p-4 bg-gray-50 border border-gray-200 rounded-lg text-center">
+                      <i className="ri-truck-line text-3xl text-gray-300 mb-2"></i>
+                      <p className="text-sm text-gray-600">No hay proveedores disponibles</p>
+                      <p className="text-xs text-gray-500 mt-1">Creá proveedores en Administración → Catálogos</p>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Buscador */}
+                      <div className="relative">
+                        <i className="ri-search-line absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"></i>
+                        <input
+                          type="text"
+                          placeholder="Buscar proveedor..."
+                          value={providerSearchTerm}
+                          onChange={(e) => setProviderSearchTerm(e.target.value)}
+                          className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm"
+                        />
+                      </div>
+
+                      {/* Contador */}
+                      <div className="flex items-center justify-between text-sm">
+                        <span className="text-gray-600">
+                          Seleccionados: <span className="font-semibold text-teal-600">{selectedProviderIds.length}</span>
+                        </span>
+                        {selectedProviderIds.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setSelectedProviderIds([])}
+                            className="text-red-600 hover:text-red-700 font-medium"
+                          >
+                            Limpiar selección
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Lista de proveedores */}
+                      <div className="border border-gray-200 rounded-lg max-h-60 overflow-y-auto">
+                        {filteredProviders.length === 0 ? (
+                          <div className="p-4 text-center text-sm text-gray-500">
+                            No se encontraron proveedores
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-gray-200">
+                            {filteredProviders.map((provider) => (
+                              <label
+                                key={provider.id}
+                                className="flex items-center gap-3 p-3 hover:bg-gray-50 cursor-pointer transition-colors"
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={selectedProviderIds.includes(provider.id)}
+                                  onChange={() => handleToggleProvider(provider.id)}
+                                  disabled={accessLoading}
+                                  className="w-4 h-4 text-teal-600 border-gray-300 rounded focus:ring-teal-500"
+                                />
+                                <div className="flex-1">
+                                  <span className="text-sm font-medium text-gray-900">{provider.name}</span>
+                                </div>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Mensaje informativo */}
+                      {!editingUser && selectedProviderIds.length > 0 && (
+                        <p className="text-xs text-gray-500">
+                          Los proveedores se asignarán al crear el usuario
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+
               <div className="flex gap-3 pt-4 border-t border-gray-200">
                 <button
                   type="button"
                   onClick={() => {
                     setShowModal(false);
                     setEditingUser(null);
-                    setFormData({ email: '', full_name: '', role_id: '', password: '' });
+                    setFormData({ email: '', full_name: '', role_id: '', password: '', phone_e164: '' });
                     setSelectedCountryIds([]);
                     setRestrictedByWarehouse(false);
                     setSelectedWarehouseIds([]);
+                    setSelectedProviderIds([]);
+                    setProviderSearchTerm('');
                     setNewlyCreatedUserId(null);
                   }}
                   className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors whitespace-nowrap"

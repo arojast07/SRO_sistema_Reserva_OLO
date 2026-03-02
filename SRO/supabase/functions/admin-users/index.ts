@@ -1,530 +1,492 @@
 // supabase/functions/admin-users/index.ts
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const BUILD_TAG =
-  "admin-users-2026-01-29_v11_unified_paged_no_getUserByEmail_create_idempotent_hard_delete_returns_userId";
+const VERSION = "admin-users@v2026-02-12.5-ORG-SCOPED-FIX";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Max-Age": "86400",
 };
 
-type Action = "list" | "create" | "update_role" | "remove_from_org" | "hard_delete";
+function reqId() {
+  return crypto.randomUUID();
+}
 
-function json(status: number, body: unknown) {
-  return new Response(JSON.stringify(body), {
+function safePrefix(v: string | null, n = 14) {
+  if (!v) return null;
+  return v.slice(0, n);
+}
+
+function json(resBody: any, status = 200) {
+  return new Response(JSON.stringify(resBody), {
     status,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-      "x-build-tag": BUILD_TAG,
-    },
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
 }
 
-function log(tag: string, data?: unknown) {
-  try {
-    console.log(`[admin-users] ${tag}`, data ? JSON.stringify(data) : "");
-  } catch {
-    console.log(`[admin-users] ${tag}`);
-  }
-}
+serve(async (req) => {
+  const id = reqId();
+  const startedAt = Date.now();
 
-function normalizeEmail(email: string) {
-  return String(email || "").trim().toLowerCase();
-}
-
-function isEmail(email: string) {
-  const e = normalizeEmail(email);
-  return e.includes("@") && e.split("@")[0].length > 0 && e.split("@")[1].includes(".");
-}
-
-function isUuid(v: string) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(v || "")
-  );
-}
-
-function pickRoleId(body: any): string | undefined {
-  if (typeof body?.roleId === "string" && body.roleId.trim()) return body.roleId.trim();
-  if (Array.isArray(body?.roleIds) && typeof body.roleIds[0] === "string" && body.roleIds[0].trim()) {
-    return body.roleIds[0].trim();
-  }
-  if (typeof body?.role_id === "string" && body.role_id.trim()) return body.role_id.trim();
-  return undefined;
-}
-
-async function readJson(req: Request) {
-  try {
-    return await req.json();
-  } catch {
-    return null;
-  }
-}
-
-const uniq = (arr: string[]) => Array.from(new Set(arr));
-
-function looksLikeDuplicateAuthError(msg: string) {
-  const m = String(msg || "").toLowerCase();
-  return (
-    m.includes("already") ||
-    m.includes("exists") ||
-    m.includes("registered") ||
-    m.includes("duplicate")
-  );
-}
-
-async function findAuthUserIdByEmailPaged(supabaseAdmin: any, email: string) {
-  const target = normalizeEmail(email);
-  const perPage = 200;
-  let page = 1;
-
-  // hard cap para evitar loops infinitos por errores
-  for (let i = 0; i < 50; i++) {
-    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
-    if (error) throw new Error(`LIST_USERS_FAILED: ${error.message}`);
-
-    const users = data?.users ?? [];
-    const hit = users.find((u: any) => normalizeEmail(u?.email ?? "") === target);
-    if (hit?.id) return hit.id;
-
-    if (users.length < perPage) return null;
-    page += 1;
-  }
-
-  return null;
-}
-
-async function ensureProfileEmailNotTakenByOtherId(supabaseAdmin: any, userId: string, email: string) {
-  // Previene el caso: profiles tiene ese email, pero con otro id distinto
-  const { data, error } = await supabaseAdmin
-    .from("profiles")
-    .select("id,email")
-    .ilike("email", email)
-    .neq("id", userId)
-    .limit(1);
-
-  if (error) throw new Error(`PROFILE_DUP_CHECK_FAILED: ${error.message}`);
-  if (Array.isArray(data) && data.length > 0) {
-    return { ok: false as const, otherProfileId: data[0]?.id ?? null };
-  }
-  return { ok: true as const };
-}
-
-async function upsertProfile(supabaseAdmin: any, userId: string, email: string, fullName: string) {
-  const { error } = await supabaseAdmin.from("profiles").upsert({
-    id: userId,
-    email,
-    name: fullName || email.split("@")[0],
-    updated_at: new Date().toISOString(),
-  });
-
-  if (error) throw new Error(`UPSERT_PROFILE_FAILED: ${error.message}`);
-}
-
-async function upsertUserOrgRole(
-  supabaseAdmin: any,
-  orgId: string,
-  userId: string,
-  roleId: string,
-  callerId: string
-) {
-  const { error } = await supabaseAdmin
-    .from("user_org_roles")
-    .upsert(
-      {
-        user_id: userId,
-        org_id: orgId,
-        role_id: roleId,
-        assigned_by: callerId,
-        assigned_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id,org_id" }
-    );
-
-  if (error) throw new Error(`ASSIGN_ROLE_FAILED: ${error.message}`);
-}
-
-Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-  if (req.method !== "POST") return json(405, { error: "METHOD_NOT_ALLOWED" });
 
-  const t0 = Date.now();
+  const authHeader = req.headers.get("authorization");
+  const apiKeyHeader = req.headers.get("apikey");
+
+  console.log(`[${VERSION}] [${id}] START`, {
+    method: req.method,
+    url: req.url,
+    hasAuthHeader: !!authHeader,
+    authPrefix: safePrefix(authHeader, 18),
+    hasApiKey: !!apiKeyHeader,
+    apikeyPrefix: safePrefix(apiKeyHeader, 16),
+  });
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
-    const anonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
-    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-    if (!supabaseUrl || !anonKey || !serviceKey) {
-      return json(500, {
-        error: "MISSING_ENV",
-        required: ["SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error(`[${VERSION}] [${id}] ENV_MISSING`, {
+        hasUrl: !!supabaseUrl,
+        hasServiceRole: !!serviceRoleKey,
       });
+      return json(
+        {
+          error: "Server misconfigured",
+          details: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY",
+          reqId: id,
+          version: VERSION,
+        },
+        500
+      );
     }
 
-    const authHeader = req.headers.get("authorization") ?? req.headers.get("Authorization") ?? "";
-    if (!authHeader.toLowerCase().startsWith("bearer ")) {
-      return json(401, { error: "UNAUTHORIZED", details: "Missing Bearer token" });
-    }
-    const token = authHeader.split(" ")[1];
-
-    const body = await readJson(req);
-    if (!body) return json(400, { error: "INVALID_JSON" });
-
-    let action: Action | undefined = body.action;
-    const orgId: string | undefined = body.orgId;
-    const debug: boolean = Boolean(body.debug);
-
-    if (action === ("update" as any)) action = "update_role";
-    if (action === ("delete" as any)) action = "remove_from_org";
-
-    if (!action || !orgId || !isUuid(orgId)) {
-      return json(400, { error: "MISSING_FIELDS", required: ["action", "orgId(uuid)"] });
-    }
-
-    log("BOOT", { BUILD_TAG, action, orgId, debug });
-
-    const supabaseAuth = createClient(supabaseUrl, anonKey, {
-      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+    const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
     });
 
-    const { data: userData, error: authError } = await supabaseAuth.auth.getUser(token);
-    if (authError || !userData?.user) {
-      log("INVALID_JWT", authError?.message);
-      return json(401, { error: "INVALID_JWT" });
+    let payload: any = null;
+    try {
+      payload = await req.json();
+    } catch {
+      console.error(`[${VERSION}] [${id}] BAD_JSON`);
+      return json(
+        { error: "Bad Request", details: "Invalid JSON body", reqId: id, version: VERSION },
+        400
+      );
     }
-    const caller = userData.user;
 
-    const supabaseAdmin = createClient(supabaseUrl, serviceKey, {
-      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+    const {
+      action,
+      userId,
+      email,
+      password,
+      metadata,
+      orgId,
+      roleId,
+      roleIds,
+      full_name,
+      phone_e164,
+      debug,
+    } = payload ?? {};
+
+    console.log(`[${VERSION}] [${id}] PAYLOAD`, {
+      action,
+      userId: userId ?? null,
+      emailPrefix: email ? safePrefix(email, 6) : null,
+      hasPassword: !!password,
+      hasMetadata: !!metadata,
+      orgId: orgId ?? null,
+      roleId: roleId ?? null,
+      roleIds: roleIds ?? null,
+      full_name: full_name ?? null,
+      phone_e164: phone_e164 ?? null,
+      debug: debug ?? false,
     });
-
-    const requiredAny: string[] =
-      action === "list"
-        ? ["admin.users.view"]
-        : action === "create"
-        ? ["admin.users.create"]
-        : action === "update_role"
-        ? ["admin.users.update", "admin.users.update_role"]
-        : ["admin.users.delete"];
-
-    const { data: uor, error: uorErr } = await supabaseAdmin
-      .from("user_org_roles")
-      .select("role_id")
-      .eq("user_id", caller.id)
-      .eq("org_id", orgId);
-
-    if (uorErr) return json(500, { error: "ROLE_LOOKUP_FAILED", details: uorErr.message });
-    if (!uor || uor.length === 0) return json(403, { error: "FORBIDDEN", details: "No role in org" });
-
-    const roleIds = uniq((uor ?? []).map((r: any) => r.role_id).filter(Boolean));
-
-    const { data: rp, error: rpErr } = await supabaseAdmin
-      .from("role_permissions")
-      .select("permissions!role_permissions_permission_id_fkey(name)")
-      .in("role_id", roleIds);
-
-    if (rpErr) return json(500, { error: "PERMISSION_LOOKUP_FAILED", details: rpErr.message });
-
-    const permSet = new Set<string>();
-    (rp ?? []).forEach((x: any) => {
-      const name = x?.permissions?.name;
-      if (name) permSet.add(name);
-    });
-
-    const hasAny = requiredAny.some((p) => permSet.has(p));
-    if (!hasAny) {
-      return json(403, {
-        error: "FORBIDDEN",
-        requiredAny,
-        debug: debug
-          ? {
-              buildTag: BUILD_TAG,
-              callerId: caller.id,
-              orgId,
-              action,
-              callerRoleIds: roleIds,
-              userPermissions: Array.from(permSet),
-              ms: Date.now() - t0,
-            }
-          : undefined,
-      });
-    }
 
     // =========================
-    // ACTIONS
+    // LIST
     // =========================
-
     if (action === "list") {
-      const { data: assignments, error: aErr } = await supabaseAdmin
-        .from("user_org_roles")
-        .select("user_id, role_id, roles(name)")
-        .eq("org_id", orgId);
-
-      if (aErr) return json(500, { error: "LIST_FAILED", details: aErr.message });
-
-      const userIds = uniq((assignments ?? []).map((a: any) => a.user_id).filter(Boolean));
-      if (userIds.length === 0) {
-        return json(200, {
-          ok: true,
-          users: [],
-          debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
-        });
+      if (!orgId) {
+        console.error(`[${VERSION}] [${id}] LIST_MISSING_ORG_ID`);
+        return json(
+          { error: "Bad Request", details: "Missing orgId", reqId: id, version: VERSION },
+          400
+        );
       }
 
-      const { data: profiles, error: pErr } = await supabaseAdmin
+      console.log(`[${VERSION}] [${id}] LIST_START`, { orgId });
+
+      const { data: userOrgRoles, error: rolesError } = await supabaseAdmin
+        .from("user_org_roles")
+        .select(
+          `
+          user_id,
+          role_id,
+          roles (
+            id,
+            name
+          )
+        `
+        )
+        .eq("org_id", orgId);
+
+      if (rolesError) {
+        console.error(`[${VERSION}] [${id}] LIST_ROLES_ERROR`, { message: rolesError.message });
+        return json(
+          { error: "Failed to fetch org users", details: rolesError.message, reqId: id, version: VERSION },
+          500
+        );
+      }
+
+      const orgUserIds = (userOrgRoles ?? []).map((uor: any) => uor.user_id);
+      console.log(`[${VERSION}] [${id}] LIST_ORG_USERS`, { count: orgUserIds.length });
+
+      if (orgUserIds.length === 0) {
+        console.log(`[${VERSION}] [${id}] LIST_SUCCESS_EMPTY`);
+        return json({ users: [], reqId: id, version: VERSION }, 200);
+      }
+
+      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.listUsers();
+      if (authError) {
+        console.error(`[${VERSION}] [${id}] LIST_AUTH_ERROR`, { message: authError.message });
+        return json(
+          { error: "Admin listUsers failed", details: authError.message, reqId: id, version: VERSION },
+          500
+        );
+      }
+
+      const authUsers = (authData?.users ?? []).filter((u: any) => orgUserIds.includes(u.id));
+      console.log(`[${VERSION}] [${id}] LIST_AUTH_USERS_FILTERED`, { count: authUsers.length });
+
+      const { data: profiles, error: profilesError } = await supabaseAdmin
         .from("profiles")
-        .select("id, email, name, created_at")
-        .in("id", userIds);
+        .select("id, name, email, phone_e164")
+        .in("id", orgUserIds);
 
-      if (pErr) return json(500, { error: "PROFILES_LOOKUP_FAILED", details: pErr.message });
+      if (profilesError) {
+        console.warn(`[${VERSION}] [${id}] LIST_PROFILES_ERROR`, { message: profilesError.message });
+      }
 
-      const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+      const profilesMap = new Map((profiles ?? []).map((p: any) => [p.id, { name: p.name, email: p.email, phone_e164: p.phone_e164 }]));
+      console.log(`[${VERSION}] [${id}] LIST_PROFILES`, { count: profilesMap.size });
 
-      const users = (assignments ?? []).map((a: any) => {
-        const p = profileMap.get(a.user_id);
+      const rolesMap = new Map(
+        (userOrgRoles ?? []).map((uor: any) => [
+          uor.user_id,
+          {
+            role_id: uor.role_id,
+            role_name: uor.roles?.name ?? null,
+          },
+        ])
+      );
+
+      const users = authUsers.map((authUser: any) => {
+        const profile = profilesMap.get(authUser.id) ?? { name: null, email: null, phone_e164: null };
+        const roleData = rolesMap.get(authUser.id) ?? { role_id: null, role_name: null };
+
         return {
-          id: a.user_id,
-          email: p?.email ?? null,
-          full_name: p?.name ?? null,
-          role_id: a.role_id,
-          role_name: a.roles?.name ?? null,
-          created_at: p?.created_at ?? null,
+          id: authUser.id,
+          email: authUser.email ?? profile.email ?? null,
+          full_name: profile.name ?? authUser.email?.split('@')[0] ?? 'Usuario',
+          phone_e164: profile.phone_e164 ?? null,
+          role_id: roleData.role_id,
+          role_name: roleData.role_name,
+          created_at: authUser.created_at ?? null,
+          last_sign_in_at: authUser.last_sign_in_at ?? null,
         };
       });
 
-      return json(200, {
-        ok: true,
-        users,
-        debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
+      console.log(`[${VERSION}] [${id}] LIST_SUCCESS`, {
+        totalUsers: users.length,
+        sample: users.slice(0, 3).map((u: any) => ({
+          id: u.id,
+          email: u.email,
+          full_name: u.full_name,
+          phone_e164: u.phone_e164,
+          role_name: u.role_name,
+        })),
       });
+
+      return json({ users, reqId: id, version: VERSION }, 200);
     }
 
+    // =========================
+    // CREATE
+    // =========================
     if (action === "create") {
-      const emailRaw: string | undefined = body.email;
-      const password: string | undefined = body.password;
-      const roleId = pickRoleId(body);
-
-      const email = normalizeEmail(emailRaw ?? "");
-      const fullName: string = String(body.full_name ?? "").trim();
-
-      if (!email || !password || !roleId)
-        return json(400, { error: "MISSING_FIELDS", required: ["email", "password", "roleId"] });
-      if (!isEmail(email)) return json(400, { error: "INVALID_EMAIL" });
-      if (!isUuid(roleId)) return json(400, { error: "INVALID_ROLE_ID" });
-
-      // 1) Buscar por email (paginado real)
-      let existingUserId: string | null = null;
-      try {
-        existingUserId = await findAuthUserIdByEmailPaged(supabaseAdmin, email);
-      } catch (e: any) {
-        log("WARN_find_by_email_failed", { message: String(e?.message ?? e) });
+      if (!orgId) {
+        console.error(`[${VERSION}] [${id}] CREATE_MISSING_ORG_ID`);
+        return json(
+          { error: "Bad Request", details: "Missing orgId", reqId: id, version: VERSION },
+          400
+        );
       }
 
-      // 2) Si existe -> NO creamos auth user
-      if (existingUserId) {
-        // Validar que profiles no tenga ese email para otro id
-        const dup = await ensureProfileEmailNotTakenByOtherId(supabaseAdmin, existingUserId, email);
-        if (!dup.ok) {
-          return json(409, {
-            ok: false,
-            error: "EMAIL_CONFLICT_IN_PROFILES",
-            details: "Ese email ya está ligado a otro profile (id distinto).",
-            otherProfileId: dup.otherProfileId,
+      if (!email) {
+        console.error(`[${VERSION}] [${id}] CREATE_MISSING_EMAIL`);
+        return json(
+          { error: "Bad Request", details: "Missing email", reqId: id, version: VERSION },
+          400
+        );
+      }
+
+      console.log(`[${VERSION}] [${id}] CREATE_START`, { email: safePrefix(email, 6), orgId, roleId, phone_e164 });
+
+      const { data: existingAuthUsers } = await supabaseAdmin.auth.admin.listUsers();
+      const existingUser = (existingAuthUsers?.users ?? []).find((u: any) => u.email?.toLowerCase() === email.toLowerCase());
+
+      let createdUserId: string;
+      let alreadyExisted = false;
+
+      if (existingUser) {
+        createdUserId = existingUser.id;
+        alreadyExisted = true;
+        console.log(`[${VERSION}] [${id}] CREATE_USER_EXISTS`, { userId: createdUserId, email: safePrefix(email, 6) });
+
+        if (full_name || phone_e164) {
+          const updateData: any = {};
+          if (full_name) updateData.name = full_name;
+          if (phone_e164 !== undefined) updateData.phone_e164 = phone_e164;
+
+          const { error: profileError } = await supabaseAdmin
+            .from("profiles")
+            .update(updateData)
+            .eq("id", createdUserId);
+
+          if (profileError) {
+            console.warn(`[${VERSION}] [${id}] CREATE_UPDATE_PROFILE_ERROR`, { message: profileError.message });
+          } else {
+            console.log(`[${VERSION}] [${id}] CREATE_UPDATE_PROFILE_SUCCESS`);
+          }
+        }
+      } else {
+        if (!password) {
+          console.error(`[${VERSION}] [${id}] CREATE_MISSING_PASSWORD`);
+          return json(
+            { error: "Bad Request", details: "Missing password for new user", reqId: id, version: VERSION },
+            400
+          );
+        }
+
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true,
+          user_metadata: metadata || {},
+        });
+
+        if (authError) {
+          console.error(`[${VERSION}] [${id}] CREATE_AUTH_ERROR`, { message: authError.message });
+          return json(
+            { error: "Admin createUser failed", details: authError.message, reqId: id, version: VERSION },
+            500
+          );
+        }
+
+        createdUserId = authData.user.id;
+        console.log(`[${VERSION}] [${id}] CREATE_AUTH_SUCCESS`, { userId: createdUserId });
+
+        const { error: profileError } = await supabaseAdmin
+          .from("profiles")
+          .upsert(
+            {
+              id: createdUserId,
+              name: full_name ?? null,
+              email,
+              phone_e164: phone_e164 ?? null,
+            },
+            { onConflict: "id" }
+          );
+
+        if (profileError) {
+          console.warn(`[${VERSION}] [${id}] CREATE_PROFILE_ERROR`, { message: profileError.message });
+        } else {
+          console.log(`[${VERSION}] [${id}] CREATE_PROFILE_SUCCESS`);
+        }
+      }
+
+      if (roleId) {
+        console.log(`[${VERSION}] [${id}] INSERTING_USER_ORG_ROLE`, {
+          user_id: createdUserId,
+          org_id: orgId,
+          role_id: roleId,
+          alreadyExisted,
+        });
+
+        const { data: insertedRole, error: roleError } = await supabaseAdmin
+          .from("user_org_roles")
+          .upsert(
+            {
+              user_id: createdUserId,
+              org_id: orgId,
+              role_id: roleId,
+              assigned_by: createdUserId,
+              assigned_at: new Date().toISOString(),
+            },
+            { onConflict: "user_id,org_id" }
+          )
+          .select();
+
+        if (roleError) {
+          console.error(`[${VERSION}] [${id}] CREATE_ROLE_ERROR`, { 
+            message: roleError.message,
+            code: roleError.code,
+          });
+          console.warn(`[${VERSION}] [${id}] Usuario ${alreadyExisted ? 're-agregado' : 'creado'} pero sin rol asignado`);
+        } else {
+          console.log(`[${VERSION}] [${id}] CREATE_ROLE_SUCCESS`, { 
+            insertedData: insertedRole,
+            rowCount: insertedRole?.length || 0
           });
         }
-
-        await upsertProfile(supabaseAdmin, existingUserId, email, fullName);
-        await upsertUserOrgRole(supabaseAdmin, orgId, existingUserId, roleId, caller.id);
-
-        return json(200, {
-          ok: true,
-          success: true,
-          userId: existingUserId,
-          user_id: existingUserId,
-          alreadyExisted: true,
-          createdNew: false,
-          debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
-        });
+      } else {
+        console.warn(`[${VERSION}] [${id}] NO_ROLE_ID_PROVIDED`);
       }
 
-      // 3) Si no existe -> creamos auth user
-      const { data: created, error: cuErr } = await supabaseAdmin.auth.admin.createUser({
-        email,
-        password,
-        email_confirm: true,
-      });
+      console.log(`[${VERSION}] [${id}] CREATE_SUCCESS`, { userId: createdUserId, alreadyExisted });
 
-      // Si chocó por carrera (otro request lo creó), buscamos de nuevo y asignamos
-      if (cuErr) {
-        const msg = String(cuErr.message ?? "");
-        const looksDup = looksLikeDuplicateAuthError(msg);
-
-        if (looksDup) {
-          const userId2 = await findAuthUserIdByEmailPaged(supabaseAdmin, email);
-          if (userId2) {
-            const dup = await ensureProfileEmailNotTakenByOtherId(supabaseAdmin, userId2, email);
-            if (!dup.ok) {
-              return json(409, {
-                ok: false,
-                error: "EMAIL_CONFLICT_IN_PROFILES",
-                details: "Ese email ya está ligado a otro profile (id distinto).",
-                otherProfileId: dup.otherProfileId,
-              });
-            }
-
-            await upsertProfile(supabaseAdmin, userId2, email, fullName);
-            await upsertUserOrgRole(supabaseAdmin, orgId, userId2, roleId, caller.id);
-
-            return json(200, {
-              ok: true,
-              success: true,
-              userId: userId2,
-              user_id: userId2,
-              alreadyExisted: true,
-              createdNew: false,
-              debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG, note: "duplicate->recovered" } : undefined,
-            });
-          }
-        }
-
-        return json(409, {
-          ok: false,
-          error: looksDup ? "DUPLICATE_EMAIL" : "CREATE_USER_FAILED",
-          details: msg,
-        });
-      }
-
-      const userId = created?.user?.id;
-      if (!userId) return json(500, { error: "CREATE_USER_FAILED", details: "missing user id" });
-
-      // 4) Validar profiles duplicado (por seguridad)
-      const dup = await ensureProfileEmailNotTakenByOtherId(supabaseAdmin, userId, email);
-      if (!dup.ok) {
-        return json(409, {
-          ok: false,
-          error: "EMAIL_CONFLICT_IN_PROFILES",
-          details: "Ese email ya está ligado a otro profile (id distinto).",
-          otherProfileId: dup.otherProfileId,
-        });
-      }
-
-      await upsertProfile(supabaseAdmin, userId, email, fullName);
-      await upsertUserOrgRole(supabaseAdmin, orgId, userId, roleId, caller.id);
-
-      return json(200, {
-        ok: true,
-        success: true,
-        userId,
-        user_id: userId,
-        alreadyExisted: false,
-        createdNew: true,
-        debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
-      });
+      return json({ 
+        userId: createdUserId, 
+        user_id: createdUserId, 
+        alreadyExisted,
+        reqId: id, 
+        version: VERSION 
+      }, 200);
     }
 
+    // =========================
+    // UPDATE_ROLE
+    // =========================
     if (action === "update_role") {
-      const userId: string | undefined = body.userId;
-      const roleId = pickRoleId(body);
+      if (!userId || !orgId) {
+        console.error(`[${VERSION}] [${id}] UPDATE_MISSING_FIELDS`);
+        return json(
+          { error: "Bad Request", details: "Missing userId or orgId", reqId: id, version: VERSION },
+          400
+        );
+      }
 
-      if (!userId || !roleId) return json(400, { error: "MISSING_FIELDS", required: ["userId", "roleId"] });
-      if (!isUuid(userId)) return json(400, { error: "INVALID_USER_ID" });
-      if (!isUuid(roleId)) return json(400, { error: "INVALID_ROLE_ID" });
+      console.log(`[${VERSION}] [${id}] UPDATE_START`, { userId, orgId, roleId, full_name, phone_e164 });
 
-      await upsertUserOrgRole(supabaseAdmin, orgId, userId, roleId, caller.id);
+      if (full_name || email || phone_e164 !== undefined) {
+        const updateData: any = {};
+        if (full_name) updateData.name = full_name;
+        if (email) updateData.email = email;
+        if (phone_e164 !== undefined) updateData.phone_e164 = phone_e164;
 
-      const emailRaw: string | undefined = body.email;
-      const full_name: string | undefined = body.full_name;
-
-      if (emailRaw || full_name) {
-        const email = emailRaw ? normalizeEmail(emailRaw) : undefined;
-        if (emailRaw && !isEmail(email ?? "")) return json(400, { error: "INVALID_EMAIL" });
-
-        if (email) {
-          const dup = await ensureProfileEmailNotTakenByOtherId(supabaseAdmin, userId, email);
-          if (!dup.ok) {
-            return json(409, { ok: false, error: "EMAIL_ALREADY_USED", otherProfileId: dup.otherProfileId });
-          }
-        }
-
-        const { error: profErr } = await supabaseAdmin
+        const { error: profileError } = await supabaseAdmin
           .from("profiles")
-          .update({
-            email: email ?? undefined,
-            name: full_name ? String(full_name).trim() : undefined,
-            updated_at: new Date().toISOString(),
-          })
+          .update(updateData)
           .eq("id", userId);
 
-        if (profErr) log("profile_update_failed", { message: profErr.message });
+        if (profileError) {
+          console.warn(`[${VERSION}] [${id}] UPDATE_PROFILE_ERROR`, { message: profileError.message });
+        } else {
+          console.log(`[${VERSION}] [${id}] UPDATE_PROFILE_SUCCESS`);
+        }
       }
 
-      return json(200, {
-        ok: true,
-        success: true,
-        userId,
-        user_id: userId,
-        debug: debug ? { buildTag: BUILD_TAG } : undefined,
-      });
+      if (roleId) {
+        console.log(`[${VERSION}] [${id}] UPDATING_USER_ORG_ROLE`, {
+          user_id: userId,
+          org_id: orgId,
+          role_id: roleId,
+        });
+
+        const { data: updatedRole, error: roleError } = await supabaseAdmin
+          .from("user_org_roles")
+          .upsert(
+            {
+              user_id: userId,
+              org_id: orgId,
+              role_id: roleId,
+              assigned_by: userId,
+              assigned_at: new Date().toISOString(),
+            },
+            { onConflict: "user_id,org_id" }
+          )
+          .select();
+
+        if (roleError) {
+          console.error(`[${VERSION}] [${id}] UPDATE_ROLE_ERROR`, { 
+            message: roleError.message,
+            code: roleError.code,
+          });
+        } else {
+          console.log(`[${VERSION}] [${id}] UPDATE_ROLE_SUCCESS`, { 
+            updatedData: updatedRole,
+            rowCount: updatedRole?.length || 0
+          });
+        }
+      }
+
+      console.log(`[${VERSION}] [${id}] UPDATE_SUCCESS`);
+      return json({ success: true, reqId: id, version: VERSION }, 200);
     }
 
-    if (action === "hard_delete") {
-      const userId: string | undefined = body.userId;
-      if (!userId) return json(400, { error: "MISSING_FIELDS", required: ["userId"] });
-      if (!isUuid(userId)) return json(400, { error: "INVALID_USER_ID" });
-
-      // 1) borrar accesos (si aplica)
-      await supabaseAdmin.from("user_country_access").delete().eq("user_id", userId).eq("org_id", orgId);
-      await supabaseAdmin.from("user_warehouse_access").delete().eq("user_id", userId).eq("org_id", orgId);
-
-      // 2) borrar rol en la org
-      await supabaseAdmin.from("user_org_roles").delete().eq("user_id", userId).eq("org_id", orgId);
-
-      // 3) borrar profile (opcional, pero coherente)
-      await supabaseAdmin.from("profiles").delete().eq("id", userId);
-
-      // 4) borrar usuario de Auth (ESTO es lo que evita el “already registered”)
-      const { error: delAuthErr } = await supabaseAdmin.auth.admin.deleteUser(userId);
-      if (delAuthErr) return json(500, { error: "DELETE_AUTH_FAILED", details: delAuthErr.message });
-
-      return json(200, {
-        ok: true,
-        success: true,
-        userId,
-        user_id: userId,
-        hardDeleted: true,
-        debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
-      });
-    }
-
+    // =========================
+    // REMOVE_FROM_ORG
+    // =========================
     if (action === "remove_from_org") {
-      const userId: string | undefined = body.userId;
-      if (!userId) return json(400, { error: "MISSING_FIELDS", required: ["userId"] });
-      if (!isUuid(userId)) return json(400, { error: "INVALID_USER_ID" });
+      if (!userId || !orgId) {
+        console.error(`[${VERSION}] [${id}] REMOVE_MISSING_FIELDS`);
+        return json(
+          { error: "Bad Request", details: "Missing userId or orgId", reqId: id, version: VERSION },
+          400
+        );
+      }
 
-      const { error: delErr } = await supabaseAdmin
+      console.log(`[${VERSION}] [${id}] REMOVE_START`, { userId, orgId });
+
+      const { error: removeError } = await supabaseAdmin
         .from("user_org_roles")
         .delete()
         .eq("user_id", userId)
         .eq("org_id", orgId);
 
-      if (delErr) return json(500, { error: "REMOVE_FAILED", details: delErr.message });
+      if (removeError) {
+        console.error(`[${VERSION}] [${id}] REMOVE_ERROR`, { message: removeError.message });
+        return json(
+          { error: "Remove from org failed", details: removeError.message, reqId: id, version: VERSION },
+          500
+        );
+      }
 
-      return json(200, {
-        ok: true,
-        success: true,
-        userId,
-        user_id: userId,
-        debug: debug ? { ms: Date.now() - t0, buildTag: BUILD_TAG } : undefined,
-      });
+      const { error: warehouseError } = await supabaseAdmin
+        .from("user_warehouse_access")
+        .delete()
+        .eq("user_id", userId);
+
+      if (warehouseError) {
+        console.warn(`[${VERSION}] [${id}] REMOVE_WAREHOUSE_ACCESS_ERROR`, { message: warehouseError.message });
+      }
+
+      const { error: providersError } = await supabaseAdmin
+        .from("user_providers")
+        .delete()
+        .eq("user_id", userId);
+
+      if (providersError) {
+        console.warn(`[${VERSION}] [${id}] REMOVE_USER_PROVIDERS_ERROR`, { message: providersError.message });
+      }
+
+      console.log(`[${VERSION}] [${id}] REMOVE_SUCCESS - Usuario desasociado de la org`);
+      return json({ success: true, reqId: id, version: VERSION }, 200);
     }
 
-    return json(400, { error: "UNKNOWN_ACTION", action });
+    return json({ error: "Invalid action", reqId: id, version: VERSION }, 400);
   } catch (e: any) {
-    console.error("[admin-users] FATAL", e);
-    return json(500, { error: "INTERNAL_ERROR", details: String(e?.message ?? e) });
+    console.error(`[${VERSION}] [${id}] UNHANDLED`, { message: e?.message ?? String(e) });
+    return json(
+      { error: "Server error", details: e?.message ?? String(e), reqId: id, version: VERSION },
+      500
+    );
+  } finally {
+    console.log(`[${VERSION}] [${id}] END`, { ms: Date.now() - startedAt });
   }
 });

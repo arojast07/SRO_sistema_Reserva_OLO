@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { usePermissions } from '../../hooks/usePermissions';
+import { useDebouncedValue } from '../../hooks/useDebouncedValue';
 import {
   calendarService,
   type Reservation,
@@ -13,6 +14,8 @@ import OperationalStatusesTab from './components/OperationalStatusesTab';
 import PreReservationMiniModal from './components/PreReservationMiniModal';
 import { useAuth } from '../../contexts/AuthContext';
 import { sortDocksByNameNumber } from '../../utils/sortDocks';
+import { ConfirmModal } from '../../components/base/ConfirmModal';
+import { dockAllocationService, type DockAllocationRule } from '../../services/dockAllocationService';
 
 type ViewMode = '1day' | '3days' | '7days';
 type TabMode = 'calendar' | 'statuses';
@@ -53,6 +56,13 @@ const getNowInTimezone = (timezone: string): Date => {
   return new Date(new Date().toLocaleString('en-US', { timeZone: timezone }));
 };
 
+// ✅ NUEVO: Helper para comparar si dos fechas son el mismo día en timezone
+const isSameDayTz = (day: Date, nowTz: Date, timezone: string): boolean => {
+  const dayStart = getStartOfDay(day, timezone);
+  const nowStart = getStartOfDay(nowTz, timezone);
+  return dayStart.getTime() === nowStart.getTime();
+};
+
 export default function CalendarioPage() {
   const { can, orgId, loading: permLoading } = usePermissions();
   const { user } = useAuth();
@@ -82,7 +92,13 @@ export default function CalendarioPage() {
   const [selectedBlock, setSelectedBlock] = useState<DockTimeBlock | null>(null);
   const [isBlockModalOpen, setIsBlockModalOpen] = useState(false);
 
-  const [searchTerm, setSearchTerm] = useState('');
+  // ✅ NUEVO: Separar términos de búsqueda
+  const [dockSearchTerm, setDockSearchTerm] = useState(''); // Para filtrar andenes (si se necesita)
+  const [reservationSearchTerm, setReservationSearchTerm] = useState(''); // Para filtrar reservas
+  
+  // ✅ NUEVO: Debounce del término de búsqueda de reservas (300ms)
+  const debouncedReservationSearch = useDebouncedValue(reservationSearchTerm, 300);
+
   const [filterCategory, setFilterCategory] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
 
@@ -95,6 +111,15 @@ export default function CalendarioPage() {
   const [preCargoTypeId, setPreCargoTypeId] = useState('');
   const [preProviderId, setPreProviderId] = useState('');
 
+  // ✅ NUEVO: Estado para reglas de asignación de andenes
+  const [allocationRule, setAllocationRule] = useState<DockAllocationRule | null>(null);
+  const [allocationLoading, setAllocationLoading] = useState(false);
+  const [allocationError, setAllocationError] = useState<string>('');
+  const [enabledDockIds, setEnabledDockIds] = useState<Set<string>>(new Set());
+
+  // ✅ NUEVO: Estado para el indicador de hora actual
+  const [nowTz, setNowTz] = useState<Date>(getNowInTimezone(TIMEZONE));
+
   // ✅ Refs para sincronización de scroll horizontal
   const bodyScrollRef = useRef<HTMLDivElement | null>(null);
   const headerInnerRef = useRef<HTMLDivElement | null>(null);
@@ -106,7 +131,16 @@ export default function CalendarioPage() {
   // ✅ Constante de ancho de columna
   const COL_W = 200;
 
-  // ✅ MOVIDOS ANTES DE LOS RETURNS: Todos los hooks useMemo deben estar aquí
+  // ✅ NUEVO: useEffect para actualizar nowTz cada 60 segundos
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setNowTz(getNowInTimezone(TIMEZONE));
+    }, 60000); // 60 segundos
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // ✅ Moved all useMemo hooks here (no hooks after returns)
   const canView = useMemo(() => can('calendar.view'), [can]);
   const canCreate = useMemo(() => can('reservations.create'), [can]);
   const canMove = useMemo(() => can('reservations.move'), [can]);
@@ -164,7 +198,7 @@ export default function CalendarioPage() {
     return days;
   }, [dateRange]);
 
-  // ✅ Filtrado de docks memorizado
+  // ✅ Filtrado de docks memorizado (SIN searchTerm de reservas)
   const filteredDocks = useMemo(() => {
     let filtered = docks;
 
@@ -172,14 +206,54 @@ export default function CalendarioPage() {
       filtered = filtered.filter((dock) => dock.category_id === filterCategory);
     }
 
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase();
-      filtered = filtered.filter((dock) => dock.name.toLowerCase().includes(term));
-    }
+    // ✅ OPCIONAL: Si en el futuro necesitas filtrar docks por nombre, usa dockSearchTerm
+    // if (dockSearchTerm) {
+    //   const term = dockSearchTerm.toLowerCase();
+    //   filtered = filtered.filter((dock) => dock.name.toLowerCase().includes(term));
+    // }
 
     // ✅ Ordenar por número natural
     return [...filtered].sort(sortDocksByNameNumber);
-  }, [docks, filterCategory, searchTerm]);
+  }, [docks, filterCategory]); // ✅ REMOVIDO: searchTerm
+
+  // ✅ NUEVO: Filtrado de reservas en memoria (NO refetch)
+  const filteredReservations = useMemo(() => {
+    if (!debouncedReservationSearch.trim()) {
+      return reservations;
+    }
+
+    const term = debouncedReservationSearch.toLowerCase().trim();
+
+    return reservations.filter((r) => {
+      // Búsqueda por DUA
+      if (r.dua && r.dua.toLowerCase().includes(term)) return true;
+
+      // Búsqueda por factura/invoice (si existe el campo)
+      if ((r as any).invoice && (r as any).invoice.toLowerCase().includes(term)) return true;
+
+      // Búsqueda por chofer/driver
+      if (r.driver && r.driver.toLowerCase().includes(term)) return true;
+
+      // Búsqueda por ID parcial (primeros 8 caracteres)
+      if (r.id && r.id.slice(0, 8).toLowerCase().includes(term)) return true;
+
+      return false;
+    });
+  }, [reservations, debouncedReservationSearch]);
+
+  // ✅ NUEVO: Recalcular enabledDockIds cuando cambia allocationRule o filteredDocks
+  // NOTA: enabledDockIds ahora se usa solo para el banner informativo (conteo).
+  // La habilitación real por slot se hace con getEnabledDockIdsForSlot en cada celda.
+  useEffect(() => {
+    if (!selectionMode) {
+      setEnabledDockIds(new Set());
+      return;
+    }
+
+    const allIds = filteredDocks.map((d) => d.id);
+    const { enabled } = dockAllocationService.getEnabledDockIds(allocationRule, allIds);
+    setEnabledDockIds(enabled);
+  }, [selectionMode, allocationRule, filteredDocks]);
 
   // ✅ Calcular ancho total: días × andenes × ancho de columna
   const totalWidth = useMemo(() => {
@@ -338,7 +412,7 @@ export default function CalendarioPage() {
     loadWarehouses();
   }, [orgId]);
 
-  // ✅ Cargar datos con caché inteligente
+  // ✅ Cargar datos con caché inteligente (SIN searchTerm)
   const loadData = useCallback(async () => {
     if (!orgId) return;
 
@@ -347,10 +421,10 @@ export default function CalendarioPage() {
 
       const { bufferStart, bufferEnd } = dateRange;
 
-      // Generar cache key incluyendo warehouseId
+      // ✅ CORREGIDO: Generar cache key SIN searchTerm
       const cacheKey = `${orgId}:${bufferStart.toISOString()}:${bufferEnd.toISOString()}:${
         warehouseId || 'all'
-      }:${filterCategory}:${searchTerm}`;
+      }:${filterCategory}`;
 
       console.log('[Calendar] loadData', {
         orgId,
@@ -434,7 +508,7 @@ export default function CalendarioPage() {
     } finally {
       setLoading(false);
     }
-  }, [orgId, dateRange, rangeDays, warehouseId, filterCategory, searchTerm]);
+  }, [orgId, dateRange, rangeDays, warehouseId, filterCategory]); // ✅ REMOVIDO: searchTerm
 
   useEffect(() => {
     if (!ready) return;
@@ -475,7 +549,7 @@ export default function CalendarioPage() {
     if (!y || !m || !d) return;
 
     setAnchorDate(new Date(y, m - 1, d));
-    setRangeDays(1); // cuando elegís fecha, mostramos 1 día
+    setRangeDays(1); // cuando eliges fecha, mostramos 1 día
   };
 
   // ✅ Navegación: Ir hacia atrás (mover anchorDate)
@@ -523,6 +597,28 @@ export default function CalendarioPage() {
   const isSlotEligible = useCallback(
     (dockId: string, day: Date, timeSlot: TimeSlot): boolean => {
       if (!selectionMode || requiredMinutes < 5) return false;
+
+      // ✅ Per-slot dock allocation: calcular habilitados dinámicamente
+      if (allocationRule && !allocationRule.allowAllDocks && allocationRule.clientDocks.length > 0) {
+        const dayStartTz = getStartOfDay(day, TIMEZONE);
+        const slotStartForAlloc = new Date(dayStartTz);
+        slotStartForAlloc.setHours(timeSlot.hour, timeSlot.minute, 0, 0);
+        const slotEndForAlloc = new Date(slotStartForAlloc.getTime() + requiredMinutes * 60 * 1000);
+
+        const enabledForSlot = dockAllocationService.getEnabledDockIdsForSlot(
+          allocationRule.clientDocks,
+          allocationRule.dockAllocationMode,
+          reservations,
+          slotStartForAlloc,
+          slotEndForAlloc
+        );
+
+        if (!enabledForSlot.has(dockId)) return false;
+      } else {
+        // Fallback al comportamiento estático anterior
+        if (enabledDockIds.size > 0 && !enabledDockIds.has(dockId)) return false;
+        if (enabledDockIds.size === 0 && allocationError) return false;
+      }
 
       const dayStartTz = getStartOfDay(day, TIMEZONE);
       const slotStart = new Date(dayStartTz);
@@ -578,6 +674,9 @@ export default function CalendarioPage() {
       blocks,
       businessStartMinutes,
       businessEndMinutes,
+      enabledDockIds,
+      allocationError,
+      allocationRule,
     ]
   );
 
@@ -593,15 +692,6 @@ export default function CalendarioPage() {
           setIsBlockModalOpen(true);
         }
       } else if (slot.eventType === 'free') {
-        /**if (canCreate) {
-          setReserveModalSlot({
-            dock_id: slot.dockId,
-            start_datetime: slot.startTime.toISOString(),
-            end_datetime: slot.endTime.toISOString(),
-          });
-          setSelectedReservation(null);
-          setReserveModalOpen(true);
-        }*/
         return;
       }
     },
@@ -651,7 +741,6 @@ export default function CalendarioPage() {
         dockId,
         date: day.toISOString(),
         time: timeSlot.label,
-        slotKey: `${dockId}-${day.toDateString()}-${timeSlot.label}`,
         eventType: 'free',
         startTime: cellStart,
         endTime: cellEnd,
@@ -669,24 +758,7 @@ export default function CalendarioPage() {
     ]
   );
 
-  // ✅ Handler para confirmar preselección y activar modo selección
-  const handlePreReservationConfirm = useCallback((payload: { cargoTypeId: string; providerId: string; requiredMinutes: number }) => {
-    console.log('[Calendar] Pre-reservation confirmed', payload);
-    setPreCargoTypeId(payload.cargoTypeId);
-    setPreProviderId(payload.providerId);
-    setRequiredMinutes(payload.requiredMinutes);
-    setSelectionMode(true);
-    setPreModalOpen(false);
-  }, []);
-
-  // ✅ Handler para salir del modo selección
-  const handleExitSelectionMode = useCallback(() => {
-    setSelectionMode(false);
-    setRequiredMinutes(0);
-    setPreCargoTypeId('');
-    setPreProviderId('');
-  }, []);
-
+  // ✅ Handler de drag start
   const handleDragStart = (e: React.DragEvent, event: CalendarEvent) => {
     if (event.type === 'reservation' && canMove) {
       setDraggedEvent(event);
@@ -715,12 +787,22 @@ export default function CalendarioPage() {
 
     // ✅ Restricciones: no cruzar de día y no salir del horario hábil
     if (newStart.toDateString() !== newEnd.toDateString()) {
-      alert('No se puede mover la reserva porque cruzaría al día siguiente.');
+      setNotifyModal({
+        isOpen: true,
+        type: 'warning',
+        title: 'No se puede mover',
+        message: 'No se puede mover la reserva porque cruzaría al día siguiente.'
+      });
       setDraggedEvent(null);
       return;
     }
     if (!isWithinBusinessHours(targetDay, newStart, newEnd)) {
-      alert('No se puede mover la reserva fuera del horario permitido del almacén.');
+      setNotifyModal({
+        isOpen: true,
+        type: 'warning',
+        title: 'Fuera de horario',
+        message: 'No se puede mover la reserva fuera del horario permitido del almacén.'
+      });
       setDraggedEvent(null);
       return;
     }
@@ -742,7 +824,12 @@ export default function CalendarioPage() {
     });
 
     if (willConflictReservation || willConflictBlock) {
-      alert('No se puede mover la reserva porque hay un conflicto de horario.');
+      setNotifyModal({
+        isOpen: true,
+        type: 'warning',
+        title: 'Conflicto de horario',
+        message: 'No se puede mover la reserva porque hay un conflicto de horario.'
+      });
       setDraggedEvent(null);
       return;
     }
@@ -758,13 +845,18 @@ export default function CalendarioPage() {
       cacheRef.current.clear();
       await loadData();
     } catch (error: any) {
-      alert(error.message || 'Error al mover la reserva. Puede haber un conflicto de horario.');
+      setNotifyModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error al mover',
+        message: error.message || 'Error al mover la reserva. Puede haber un conflicto de horario.'
+      });
     } finally {
       setDraggedEvent(null);
     }
   };
 
-  // ✅ Handler de scroll con sincronización horizontal usando RAF
+  // ✅ Handler de scroll con sincronización horizontal usando RAF (único)
   const handleBodyScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     const scrollLeft = e.currentTarget.scrollLeft;
 
@@ -779,7 +871,82 @@ export default function CalendarioPage() {
     });
   }, []);
 
-  // ✅ AHORA LOS RETURNS CONDICIONALES VIENEN DESPUÉS DE TODOS LOS HOOKS
+  // ✅ Modal de notificación (state)
+  const [notifyModal, setNotifyModal] = useState({
+    isOpen: false,
+    type: 'info' as 'info' | 'warning' | 'error' | 'success',
+    title: '',
+    message: '',
+  });
+
+  // ✅ NUEVO: Handler para confirmar preselección y activar modo selección
+  const handlePreReservationConfirm = useCallback(async (payload: { cargoTypeId: string; providerId: string; clientId: string; requiredMinutes: number }) => {
+    console.log('[Calendar] Pre-reservation confirmed', payload);
+    setPreCargoTypeId(payload.cargoTypeId);
+    setPreProviderId(payload.providerId);
+    setRequiredMinutes(payload.requiredMinutes);
+    setPreModalOpen(false);
+
+    // ✅ REESCRITO: Cargar reglas usando clientId directamente (no providerId)
+    setAllocationLoading(true);
+    setAllocationError('');
+    setAllocationRule(null);
+
+    const clientId = payload.clientId;
+
+    if (!clientId) {
+      console.warn('[DockAllocation] missing clientId - no client linked to provider');
+      setAllocationError('No se encontró un cliente vinculado al proveedor. Las reglas de andenes no se aplicarán.');
+      setAllocationRule(null);
+      setAllocationLoading(false);
+      setSelectionMode(true);
+      return;
+    }
+
+    try {
+      console.log('[DockAllocation] context', { orgId, warehouseId, clientId });
+
+      const rule = await dockAllocationService.getDockAllocationRule(
+        orgId!,
+        clientId
+      );
+
+      if (!rule) {
+        console.warn('[DockAllocation] missing - could not load allocation rule for clientId', clientId);
+        setAllocationError('No se pudieron cargar las reglas del cliente. Contactá a un administrador.');
+        setAllocationRule(null);
+      } else {
+        setAllocationRule(rule);
+        setAllocationError('');
+        console.log('[DockAllocation] rule loaded successfully', {
+          clientId: rule.clientId,
+          clientName: rule.clientName,
+          mode: rule.dockAllocationMode,
+          docksCount: rule.clientDocks.length,
+        });
+      }
+    } catch (err: any) {
+      console.error('[DockAllocation] error loading allocation rule', err);
+      setAllocationError('No se pudieron cargar las reglas del cliente. Contactá a un administrador.');
+      setAllocationRule(null);
+    } finally {
+      setAllocationLoading(false);
+      setSelectionMode(true);
+    }
+  }, [orgId, warehouseId]);
+
+  // ✅ NUEVO: Handler para salir del modo selección
+  const handleExitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setRequiredMinutes(0);
+    setPreCargoTypeId('');
+    setPreProviderId('');
+    setAllocationRule(null);
+    setAllocationError('');
+    setEnabledDockIds(new Set());
+  }, []);
+
+  // ✅ Render
   if (permLoading || loading) {
     return (
       <div className="flex items-center justify-center h-screen">
@@ -803,7 +970,6 @@ export default function CalendarioPage() {
     );
   }
 
-  // Helper seguro para obtener color de categoría
   const getCategoryColor = (cat: any): string => {
     if (!cat) return '#F9FAFB';
     if (typeof cat === 'object' && cat.color) return `${cat.color}15`;
@@ -824,7 +990,7 @@ export default function CalendarioPage() {
                   : 'border-transparent text-gray-600 hover:text-gray-900'
               }`}
             >
-              <i className="ri-calendar-line mr-2"></i>
+              <i className="ri-calendar-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
               Calendario
             </button>
             {canManageStatuses && (
@@ -836,7 +1002,7 @@ export default function CalendarioPage() {
                     : 'border-transparent text-gray-600 hover:text-gray-900'
                 }`}
               >
-                <i className="ri-list-check mr-2"></i>
+                <i className="ri-list-check mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                 Estatus Op
               </button>
             )}
@@ -851,15 +1017,20 @@ export default function CalendarioPage() {
         </div>
       ) : (
         <>
-          {/* ✅ NUEVO: Banner de modo selección */}
+          {/* Banner de modo selección */}
           {selectionMode && (
             <div className="bg-teal-600 text-white px-6 py-3 flex items-center justify-between">
               <div className="flex items-center gap-3">
-                <i className="ri-cursor-line text-xl"></i>
+                <i className="ri-cursor-line text-xl w-5 h-5 flex items-center justify-center"></i>
                 <div>
                   <p className="font-semibold">Modo selección activo</p>
                   <p className="text-sm text-teal-100">
                     Seleccioná un espacio disponible en el calendario ({requiredMinutes} min requeridos)
+                    {allocationRule && !allocationRule.allowAllDocks && (
+                      <span className="ml-2">
+                        — Cliente: {allocationRule.clientName} | Modo: {allocationRule.dockAllocationMode === 'ODD_FIRST' ? 'Intercalado' : 'Secuencial'} | Andenes habilitados: {enabledDockIds.size}
+                      </span>
+                    )}
                   </p>
                 </div>
               </div>
@@ -867,9 +1038,28 @@ export default function CalendarioPage() {
                 onClick={handleExitSelectionMode}
                 className="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg font-medium transition-colors whitespace-nowrap"
               >
-                <i className="ri-close-line mr-2"></i>
+                <i className="ri-close-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                 Salir
               </button>
+            </div>
+          )}
+
+          {/* ✅ NUEVO: Banner de error de reglas */}
+          {selectionMode && allocationError && (
+            <div className="bg-amber-500 text-white px-6 py-3 flex items-center gap-3">
+              <i className="ri-alert-line text-xl w-5 h-5 flex items-center justify-center"></i>
+              <div>
+                <p className="font-semibold">Reglas no disponibles</p>
+                <p className="text-sm text-amber-100">{allocationError}</p>
+              </div>
+            </div>
+          )}
+
+          {/* ✅ NUEVO: Banner de carga de reglas */}
+          {selectionMode && allocationLoading && (
+            <div className="bg-blue-500 text-white px-6 py-3 flex items-center gap-3">
+              <i className="ri-loader-4-line text-xl w-5 h-5 flex items-center justify-center animate-spin"></i>
+              <p className="font-medium">Cargando reglas de asignación de andenes...</p>
             </div>
           )}
 
@@ -893,10 +1083,10 @@ export default function CalendarioPage() {
 
                 <div className="flex items-center gap-2">
                   <button onClick={goToPrevious} className="p-2 hover:bg-gray-100 rounded-lg">
-                    <i className="ri-arrow-left-s-line text-xl"></i>
+                    <i className="ri-arrow-left-s-line text-xl w-5 h-5 flex items-center justify-center"></i>
                   </button>
                   <button onClick={goToNext} className="p-2 hover:bg-gray-100 rounded-lg">
-                    <i className="ri-arrow-right-s-line text-xl"></i>
+                    <i className="ri-arrow-right-s-line text-xl w-5 h-5 flex items-center justify-center"></i>
                   </button>
                 </div>
 
@@ -938,7 +1128,7 @@ export default function CalendarioPage() {
                         : 'bg-blue-50 text-blue-700'
                     }`}
                   >
-                    <i className="ri-building-2-line mr-2"></i>
+                    <i className="ri-building-2-line mr-2 w-4 h-4 flex items-center justify-center"></i>
                     {warehouseLoading
                       ? 'Cargando…'
                       : selectedWarehouse
@@ -954,7 +1144,6 @@ export default function CalendarioPage() {
                     Seleccionar Almacén
                   </button>
 
-                  {/* ✅ MODIFICADO: Botón Nueva Reserva abre PreReservationMiniModal */}
                   {canCreate && (
                     <button
                       onClick={() => setPreModalOpen(true)}
@@ -962,7 +1151,7 @@ export default function CalendarioPage() {
                       className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 font-medium whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
                       title="Crear reserva"
                     >
-                      <i className="ri-add-line mr-2"></i>
+                      <i className="ri-add-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                       Nueva Reserva
                     </button>
                   )}
@@ -970,12 +1159,13 @@ export default function CalendarioPage() {
               </div>
 
               <div className="flex items-center gap-4 flex-wrap justify-end ml-auto">
+                {/* ✅ CORREGIDO: Input de búsqueda de reservas */}
                 <div className="flex-1 min-w-[320px] max-w-[520px]">
                   <input
                     type="text"
                     placeholder="Buscar por DUA, Factura o Chofer..."
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
+                    value={reservationSearchTerm}
+                    onChange={(e) => setReservationSearchTerm(e.target.value)}
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent"
                   />
                 </div>
@@ -1001,7 +1191,7 @@ export default function CalendarioPage() {
                     }}
                     className="shrink-0 px-4 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 font-medium whitespace-nowrap"
                   >
-                    <i className="ri-lock-line mr-2"></i>
+                    <i className="ri-lock-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                     Bloquear Tiempo
                   </button>
                 )}
@@ -1016,13 +1206,13 @@ export default function CalendarioPage() {
             </div>
           </div>
 
-          {/* ✅ Calendario Scheduler */}
+          {/* Calendario Scheduler */}
           <div className="flex-1 overflow-hidden">
             {filteredDocks.length === 0 ? (
               <div className="h-full flex items-center justify-center p-6">
                 <div className="text-center max-w-md">
                   <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <i className="ri-inbox-line text-4xl text-gray-400"></i>
+                    <i className="ri-inbox-line text-4xl text-gray-400 w-10 h-10 flex items-center justify-center"></i>
                   </div>
                   {selectedWarehouse ? (
                     <>
@@ -1038,14 +1228,14 @@ export default function CalendarioPage() {
                           onClick={() => window.REACT_APP_NAVIGATE('/andenes')}
                           className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 font-medium whitespace-nowrap"
                         >
-                          <i className="ri-road-map-line mr-2"></i>
+                          <i className="ri-road-map-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                           Ir a Andenes
                         </button>
                         <button
                           onClick={() => setWarehouseModalOpen(true)}
                           className="px-4 py-2 bg-white border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium whitespace-nowrap"
                         >
-                          <i className="ri-building-2-line mr-2"></i>
+                          <i className="ri-building-2-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                           Cambiar Almacén
                         </button>
                       </div>
@@ -1061,7 +1251,7 @@ export default function CalendarioPage() {
                         onClick={() => window.REACT_APP_NAVIGATE('/andenes')}
                         className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 font-medium whitespace-nowrap"
                       >
-                        <i className="ri-road-map-line mr-2"></i>
+                        <i className="ri-road-map-line mr-2 w-4 h-4 inline-flex items-center justify-center"></i>
                         Ir a Andenes
                       </button>
                     </>
@@ -1070,7 +1260,7 @@ export default function CalendarioPage() {
               </div>
             ) : (
               <div className="h-full flex flex-col">
-                {/* ✅ Encabezado FIJO (días + andenes) */}
+                {/* Encabezado FIJO (días + andenes) */}
                 <div className="flex-shrink-0 bg-white border-b border-gray-200">
                   <div className="flex">
                     {/* Espacio para columna de horas */}
@@ -1118,10 +1308,10 @@ export default function CalendarioPage() {
                   </div>
                 </div>
 
-                {/* ✅ BODY: Único contenedor con scroll vertical + horizontal */}
+                {/* BODY: Único contenedor con scroll vertical + horizontal */}
                 <div ref={bodyScrollRef} className="flex-1 h-full overflow-auto" onScroll={handleBodyScroll}>
                   <div className="flex" style={{ width: totalWidth, minWidth: totalWidth }}>
-                    {/* ✅ Columna de horas (sticky left + z-30 para quedar arriba) */}
+                    {/* Columna de horas (sticky left + z-30 para quedar arriba) */}
                     <div className="w-20 flex-shrink-0 bg-white border-r border-gray-200 sticky left-0 z-30 shadow-sm">
                       {timeSlots.map((slot) => (
                         <div
@@ -1133,189 +1323,253 @@ export default function CalendarioPage() {
                       ))}
                     </div>
 
-                    {/* ✅ Grid de días y andenes (z-10 para quedar debajo) */}
+                    {/* Grid de días y andenes (z-10 para quedar debajo) */}
                     <div
                       className="flex-shrink-0"
                       style={{ width: `${totalWidth - 80}px`, minWidth: `${totalWidth - 80}px` }}
                     >
                       <div className="flex">
-                        {daysInView.map((day) => (
-                          <div
-                            key={day.toISOString()}
-                            className="flex-shrink-0 border-r border-gray-200"
-                            style={{
-                              width: `${filteredDocks.length * COL_W}px`,
-                              minWidth: `${filteredDocks.length * COL_W}px`,
-                            }}
-                          >
-                            <div className="flex">
-                              {filteredDocks.map((dock) => (
+                        {daysInView.map((day) => {
+                          // ✅ NUEVO: Calcular si este día es "hoy" y si debe mostrar el indicador
+                          const isToday = isSameDayTz(day, nowTz, TIMEZONE);
+                          const nowTop = isToday ? getTopFromBusinessStart(nowTz) : -1;
+                          const maxHeight = (businessEndMinutes - businessStartMinutes) * PX_PER_MINUTE_DYNAMIC;
+                          const shouldShowNowIndicator = isToday && nowTop >= 0 && nowTop <= maxHeight;
+
+                          return (
+                            <div
+                              key={day.toISOString()}
+                              className="flex-shrink-0 border-r border-gray-200 relative"
+                              style={{
+                                width: `${filteredDocks.length * COL_W}px`,
+                                minWidth: `${filteredDocks.length * COL_W}px`,
+                              }}
+                            >
+                              {/* ✅ NUEVO: Indicador de hora actual (NOW INDICATOR) */}
+                              {shouldShowNowIndicator && (
                                 <div
-                                  key={dock.id}
-                                  className="flex-shrink-0 border-r border-gray-200"
-                                  style={{ width: `${COL_W}px`, minWidth: `${COL_W}px` }}
+                                  className="absolute left-0 right-0 pointer-events-none z-40"
+                                  style={{ top: `${nowTop}px` }}
                                 >
-                                  {/* ✅ CONTENEDOR RELATIVE PARA SUPERPONER */}
-                                  <div className="relative">
-                                    {/* ✅ CAPA GRID (ABAJO) - z-0 */}
-                                    <div className="relative z-0">
-                                      {timeSlots.map((slot) => {
-                                        const eligible = selectionMode ? isSlotEligible(dock.id, day, slot) : false;
-                                        const inSelectionMode = selectionMode;
+                                  {/* Punto rojo al inicio */}
+                                  <div
+                                    className="absolute rounded-full"
+                                    style={{
+                                      width: '10px',
+                                      height: '10px',
+                                      backgroundColor: '#ef4444',
+                                      left: '-5px',
+                                      top: '-4px',
+                                    }}
+                                  />
+                                  {/* Línea roja horizontal */}
+                                  <div
+                                    className="absolute left-0 right-0"
+                                    style={{
+                                      height: '2px',
+                                      backgroundColor: '#ef4444',
+                                    }}
+                                  />
+                                </div>
+                              )}
 
-                                        return (
-                                          <div
-                                            key={slot.label}
-                                            className={`h-[60px] border-b border-gray-100 transition-colors ${
-                                              inSelectionMode
-                                                ? eligible
-                                                  ? 'hover:bg-teal-50 cursor-pointer border-teal-200'
-                                                  : 'bg-gray-100/50 cursor-not-allowed'
-                                                : 'hover:bg-gray-50 cursor-pointer'
-                                            }`}
-                                            onClick={(e) => handleCellClick(e, dock.id, day, slot)}
-                                            onDragOver={handleDragOver}
-                                            onDrop={(e) => handleDrop(e, dock.id, day, slot)}
-                                          />
-                                        );
-                                      })}
-                                    </div>
-
-                                    {/* ✅ CAPA OVERLAY (ARRIBA) - z-20 */}
-                                    <div className="absolute inset-0 z-20 pointer-events-none">
-                                      {/* Renderizar RESERVAS */}
-                                      {reservations
-                                        .filter((r) => {
-                                          if (r.dock_id !== dock.id) return false;
-                                          const rStart = new Date(r.start_datetime);
-                                          return rStart.toDateString() === day.toDateString();
-                                        })
-                                        .map((reservation) => {
-                                          const start = new Date(reservation.start_datetime);
-                                          const end = new Date(reservation.end_datetime);
-
-                                          // ✅ Clamp visual
-                                          const clamped = clampEventToBusinessHours(day, start, end);
-                                          if (!clamped) return null;
-
-                                          const { top, height } = clamped;
+                              <div className="flex">
+                                {filteredDocks.map((dock) => (
+                                  <div
+                                    key={dock.id}
+                                    className="flex-shrink-0 border-r border-gray-200"
+                                    style={{ width: `${COL_W}px`, minWidth: `${COL_W}px` }}
+                                  >
+                                    {/* CONTENEDOR RELATIVE PARA SUPERPONER */}
+                                    <div className="relative">
+                                      {/* CAPA GRID (ABAJO) - z-0 */}
+                                      <div className="relative z-0">
+                                        {timeSlots.map((slot) => {
+                                          const eligible = selectionMode ? isSlotEligible(dock.id, day, slot) : false;
+                                          const inSelectionMode = selectionMode;
+                                          // ✅ NUEVO: Verificar si el dock está deshabilitado por reglas
+                                          const dockDisabledByRule = inSelectionMode && enabledDockIds.size > 0 && !enabledDockIds.has(dock.id);
+                                          const dockBlockedByError = inSelectionMode && allocationError && enabledDockIds.size === 0;
 
                                           return (
                                             <div
-                                              key={reservation.id}
-                                              draggable={canMove}
-                                              onDragStart={(e) =>
-                                                handleDragStart(e, {
-                                                  type: 'reservation',
-                                                  id: reservation.id,
-                                                  dockId: dock.id,
-                                                  startTime: start,
-                                                  endTime: end,
-                                                  data: reservation,
-                                                })
-                                              }
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                handleSelectSlot({
-                                                  dockId: dock.id,
-                                                  date: day.toISOString(),
-                                                  time: '',
-                                                  eventType: 'reservation',
-                                                  id: reservation.id,
-                                                  data: reservation,
-                                                  startTime: start,
-                                                  endTime: end,
-                                                });
-                                              }}
-                                              className="absolute left-1 right-1 rounded-lg border-l-4 bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer overflow-hidden pointer-events-auto"
-                                              style={{
-                                                top: `${top}px`,
-                                                height: `${height}px`,
-                                                borderLeftColor: reservation.status?.color || '#6B7280',
-                                                minHeight: '40px',
-                                              }}
-                                            >
-                                              <div className="p-2 h-full flex flex-col justify-between text-xs">
-                                                <div>
-                                                  <div className="font-semibold text-gray-900 truncate">
-                                                    #{reservation.id.slice(0, 8)}
-                                                  </div>
-                                                  <div className="text-gray-600 truncate">{reservation.driver}</div>
-                                                  <div className="text-gray-500 truncate text-[10px]">
-                                                    DUA: {reservation.dua}
-                                                  </div>
-                                                </div>
-                                                <div className="flex items-center justify-between mt-1">
-                                                  <span
-                                                    className="px-2 py-0.5 rounded text-[10px] font-medium text-white"
-                                                    style={{ backgroundColor: reservation.status?.color || '#6B7280' }}
-                                                  >
-                                                    {reservation.status?.name || 'Sin estado'}
-                                                  </span>
-                                                  <span className="text-[10px] text-gray-500">
-                                                    {start.getHours().toString().padStart(2, '0')}:
-                                                    {start.getMinutes().toString().padStart(2, '0')}
-                                                  </span>
-                                                </div>
-                                              </div>
-                                            </div>
+                                              key={slot.label}
+                                              className={`h-[60px] border-b border-gray-100 transition-colors ${
+                                                inSelectionMode
+                                                  ? eligible
+                                                    ? 'hover:bg-teal-50 cursor-pointer border-teal-200'
+                                                    : dockDisabledByRule || dockBlockedByError
+                                                    ? 'bg-red-50/40 cursor-not-allowed'
+                                                    : 'bg-gray-100/50 cursor-not-allowed'
+                                                  : 'hover:bg-gray-50 cursor-pointer'
+                                              }`}
+                                              onClick={(e) => handleCellClick(e, dock.id, day, slot)}
+                                              onDragOver={handleDragOver}
+                                              onDrop={(e) => handleDrop(e, dock.id, day, slot)}
+                                            />
                                           );
                                         })}
+                                      </div>
 
-                                      {/* Renderizar BLOQUES */}
-                                      {blocks
-                                        .filter((b) => {
-                                          if (b.dock_id !== dock.id) return false;
-                                          const bStart = new Date(b.start_datetime);
-                                          return bStart.toDateString() === day.toDateString();
-                                        })
-                                        .map((block) => {
-                                          const start = new Date(block.start_datetime);
-                                          const end = new Date(block.end_datetime);
+                                      {/* CAPA OVERLAY (ARRIBA) - z-20 */}
+                                      <div className="absolute inset-0 z-20 pointer-events-none">
+                                        {/* ✅ CORREGIDO: Renderizar RESERVAS filtradas */}
+                                        {filteredReservations
+                                          .filter((r) => {
+                                            if (r.dock_id !== dock.id) return false;
+                                            const rStart = new Date(r.start_datetime);
+                                            return rStart.toDateString() === day.toDateString();
+                                          })
+                                          .map((reservation) => {
+                                            const start = new Date(reservation.start_datetime);
+                                            const end = new Date(reservation.end_datetime);
 
-                                          // ✅ Clamp visual
-                                          const clamped = clampEventToBusinessHours(day, start, end);
-                                          if (!clamped) return null;
+                                            const clamped = clampEventToBusinessHours(day, start, end);
+                                            if (!clamped) return null;
 
-                                          const { top, height } = clamped;
+                                            const { top, height } = clamped;
 
-                                          return (
-                                            <div
-                                              key={block.id}
-                                              onClick={(e) => {
-                                                e.stopPropagation();
-                                                handleSelectSlot({
-                                                  dockId: dock.id,
-                                                  date: day.toISOString(),
-                                                  time: '',
-                                                  eventType: 'block',
-                                                  id: block.id,
-                                                  data: block,
-                                                  startTime: start,
-                                                  endTime: end,
-                                                });
-                                              }}
-                                              className="absolute left-1 right-1 rounded-lg bg-gray-400 text-white shadow-sm cursor-pointer overflow-hidden pointer-events-auto"
-                                              style={{
-                                                top: `${top}px`,
-                                                height: `${height}px`,
-                                                minHeight: '40px',
-                                              }}
-                                            >
-                                              <div className="p-2 h-full flex flex-col justify-center text-xs">
-                                                <div className="font-semibold">Bloqueado</div>
-                                                <div className="text-[10px] opacity-90 truncate">{block.reason}</div>
+                                            return (
+                                              <div
+                                                key={reservation.id}
+                                                draggable={canMove && !selectionMode}
+                                                onDragStart={(e) => {
+                                                  if (selectionMode) { e.preventDefault(); return; }
+                                                  handleDragStart(e, {
+                                                    type: 'reservation',
+                                                    id: reservation.id,
+                                                    dockId: dock.id,
+                                                    startTime: start,
+                                                    endTime: end,
+                                                    data: reservation,
+                                                  });
+                                                }}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  // ✅ En modo selección, NO abrir modal de edición
+                                                  if (selectionMode) {
+                                                    setNotifyModal({
+                                                      isOpen: true,
+                                                      type: 'warning',
+                                                      title: 'Espacio ocupado',
+                                                      message: 'Ese espacio ya está reservado. Seleccioná un espacio disponible (verde).',
+                                                    });
+                                                    return;
+                                                  }
+                                                  handleSelectSlot({
+                                                    dockId: dock.id,
+                                                    date: day.toISOString(),
+                                                    time: '',
+                                                    eventType: 'reservation',
+                                                    id: reservation.id,
+                                                    data: reservation,
+                                                    startTime: start,
+                                                    endTime: end,
+                                                  });
+                                                }}
+                                                className={`absolute left-1 right-1 rounded-lg border-l-4 bg-white shadow-sm hover:shadow-md transition-shadow overflow-hidden pointer-events-auto ${
+                                                  selectionMode ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'
+                                                }`}
+                                                style={{
+                                                  top: `${top}px`,
+                                                  height: `${height}px`,
+                                                  borderLeftColor: reservation.status?.color || '#6B7280',
+                                                  minHeight: '40px',
+                                                }}
+                                              >
+                                                <div className="p-2 h-full flex flex-col justify-between text-xs">
+                                                  <div>
+                                                    <div className="font-semibold text-gray-900 truncate">
+                                                      #{reservation.id.slice(0, 8)}
+                                                    </div>
+                                                    <div className="text-gray-600 truncate">{reservation.driver}</div>
+                                                    <div className="text-gray-500 truncate text-[10px]">
+                                                      DUA: {reservation.dua}
+                                                    </div>
+                                                  </div>
+                                                  <div className="flex items-center justify-between mt-1">
+                                                    <span
+                                                      className="px-2 py-0.5 rounded text-[10px] font-medium text-white"
+                                                      style={{ backgroundColor: reservation.status?.color || '#6B7280' }}
+                                                    >
+                                                      {reservation.status?.name || 'Sin estado'}
+                                                    </span>
+                                                    <span className="text-[10px] text-gray-500">
+                                                      {start.getHours().toString().padStart(2, '0')}:
+                                                      {start.getMinutes().toString().padStart(2, '0')}
+                                                    </span>
+                                                  </div>
+                                                </div>
                                               </div>
-                                            </div>
-                                          );
-                                        })}
+                                            );
+                                          })}
+
+                                        {/* Renderizar BLOQUES (sin cambios) */}
+                                        {blocks
+                                          .filter((b) => {
+                                            if (b.dock_id !== dock.id) return false;
+                                            const bStart = new Date(b.start_datetime);
+                                            return bStart.toDateString() === day.toDateString();
+                                          })
+                                          .map((block) => {
+                                            const start = new Date(block.start_datetime);
+                                            const end = new Date(block.end_datetime);
+
+                                            const clamped = clampEventToBusinessHours(day, start, end);
+                                            if (!clamped) return null;
+
+                                            const { top, height } = clamped;
+
+                                            return (
+                                              <div
+                                                key={block.id}
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  // ✅ En modo selección, NO abrir modal de bloque
+                                                  if (selectionMode) {
+                                                    setNotifyModal({
+                                                      isOpen: true,
+                                                      type: 'warning',
+                                                      title: 'Horario no disponible',
+                                                      message: 'Este horario está bloqueado. Seleccioná un espacio disponible (verde).',
+                                                    });
+                                                    return;
+                                                  }
+                                                  handleSelectSlot({
+                                                    dockId: dock.id,
+                                                    date: day.toISOString(),
+                                                    time: '',
+                                                    eventType: 'block',
+                                                    id: block.id,
+                                                    data: block,
+                                                    startTime: start,
+                                                    endTime: end,
+                                                  });
+                                                }}
+                                                className={`absolute left-1 right-1 rounded-lg bg-gray-400 text-white shadow-sm overflow-hidden pointer-events-auto ${
+                                                  selectionMode ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'
+                                                }`}
+                                                style={{
+                                                  top: `${top}px`,
+                                                  height: `${height}px`,
+                                                  minHeight: '40px',
+                                                }}
+                                              >
+                                                <div className="p-2 h-full flex flex-col justify-center text-xs">
+                                                  <div className="font-semibold">Bloqueado</div>
+                                                  <div className="text-[10px] opacity-90 truncate">{block.reason}</div>
+                                                </div>
+                                              </div>
+                                            );
+                                          })}
+                                      </div>
                                     </div>
                                   </div>
-                                </div>
-                              ))}
+                                ))}
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   </div>
@@ -1324,7 +1578,7 @@ export default function CalendarioPage() {
             )}
           </div>
 
-          {/* ✅ ReservationModal con defaults preseleccionados */}
+          {/* ReservationModal con defaults preseleccionados */}
           <ReservationModal
             isOpen={reserveModalOpen}
             reservation={selectedReservation}
@@ -1341,7 +1595,6 @@ export default function CalendarioPage() {
               setReserveModalOpen(false);
               setSelectedReservation(null);
               setReserveModalSlot(null);
-              // Limpiar caché y recargar
               cacheRef.current.clear();
               await loadData();
             }}
@@ -1358,18 +1611,18 @@ export default function CalendarioPage() {
               onSave={async () => {
                 setIsBlockModalOpen(false);
                 setSelectedBlock(null);
-                // Limpiar caché y recargar
                 cacheRef.current.clear();
                 await loadData();
               }}
             />
           )}
 
-          {/* ✅ NUEVO: PreReservationMiniModal */}
+          {/* PreReservationMiniModal */}
           <PreReservationMiniModal
             isOpen={preModalOpen}
             onClose={() => setPreModalOpen(false)}
             orgId={orgId!}
+            warehouseId={warehouseId}
             warehouseLabel={warehouseLabel}
             onConfirm={handlePreReservationConfirm}
           />
@@ -1384,7 +1637,7 @@ export default function CalendarioPage() {
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 bg-teal-100 rounded-lg flex items-center justify-center">
-                  <i className="ri-building-2-line text-xl text-teal-600"></i>
+                  <i className="ri-building-2-line text-xl text-teal-600 w-5 h-5 flex items-center justify-center"></i>
                 </div>
                 <div>
                   <h2 className="text-xl font-bold text-gray-900">Seleccionar Almacén</h2>
@@ -1398,7 +1651,7 @@ export default function CalendarioPage() {
                 onClick={() => setWarehouseModalOpen(false)}
                 className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-700"
               >
-                <i className="ri-close-line text-xl"></i>
+                <i className="ri-close-line text-xl w-5 h-5 flex items-center justify-center"></i>
               </button>
             </div>
 
@@ -1418,14 +1671,14 @@ export default function CalendarioPage() {
                     <div className="flex-1">
                       <div className="flex items-center gap-2">
                         <h3 className="font-semibold text-gray-900">Ver todos los andenes</h3>
-                        {warehouseId === null && <i className="ri-check-line text-blue-600"></i>}
+                        {warehouseId === null && <i className="ri-check-line text-blue-600 w-5 h-5 flex items-center justify-center"></i>}
                       </div>
                       <p className="text-sm text-gray-600 mt-1">
                         Muestra los andenes de todos los almacenes sin filtrar
                       </p>
                     </div>
                     <div className="w-10 h-10 bg-blue-100 rounded-lg flex items-center justify-center ml-4">
-                      <i className="ri-stack-line text-xl text-blue-600"></i>
+                      <i className="ri-stack-line text-xl text-blue-600 w-5 h-5 flex items-center justify-center"></i>
                     </div>
                   </div>
                 </button>
@@ -1433,7 +1686,7 @@ export default function CalendarioPage() {
                 {/* Lista de almacenes */}
                 {warehouses.length === 0 ? (
                   <div className="text-center py-12">
-                    <i className="ri-inbox-line text-5xl text-gray-300"></i>
+                    <i className="ri-inbox-line text-5xl text-gray-300 w-12 h-12 flex items-center justify-center mx-auto"></i>
                     <p className="mt-4 text-gray-600">No hay almacenes disponibles</p>
                     <p className="text-sm text-gray-500 mt-2">Crea almacenes desde el módulo de Administración</p>
                   </div>
@@ -1452,10 +1705,9 @@ export default function CalendarioPage() {
                         <div className="flex-1">
                           <div className="flex items-center gap-2">
                             <h3 className="font-semibold text-gray-900">{warehouse.name}</h3>
-                            {warehouseId === warehouse.id && <i className="ri-check-line text-teal-600"></i>}
+                            {warehouseId === warehouse.id && <i className="ri-check-line text-teal-600 w-5 h-5 flex items-center justify-center"></i>}
                           </div>
                           {warehouse.location && <p className="text-sm text-gray-600 mt-1">{warehouse.location}</p>}
-                          {/* Info de horario si viene */}
                           {(warehouse as any).business_start_time && (warehouse as any).business_end_time && (
                             <p className="text-xs text-gray-500 mt-1">
                               Horario: {(warehouse as any).business_start_time?.slice(0, 5)} -{' '}
@@ -1465,7 +1717,7 @@ export default function CalendarioPage() {
                           )}
                         </div>
                         <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center ml-4">
-                          <i className="ri-building-2-fill text-xl text-gray-400"></i>
+                          <i className="ri-building-2-fill text-xl text-gray-400 w-5 h-5 flex items-center justify-center"></i>
                         </div>
                       </div>
                     </button>
@@ -1476,6 +1728,16 @@ export default function CalendarioPage() {
           </div>
         </div>
       )}
+
+      {/* Modal de notificación */}
+      <ConfirmModal
+        isOpen={notifyModal.isOpen}
+        type={notifyModal.type}
+        title={notifyModal.title}
+        message={notifyModal.message}
+        onConfirm={() => setNotifyModal({ ...notifyModal, isOpen: false })}
+        onCancel={() => setNotifyModal({ ...notifyModal, isOpen: false })}
+      />
     </div>
   );
 }

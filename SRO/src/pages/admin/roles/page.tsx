@@ -1,7 +1,7 @@
-
 import { useState, useEffect } from 'react';
 import { supabase } from '../../../lib/supabase';
 import { usePermissions } from '../../../hooks/usePermissions';
+import { ConfirmModal } from '../../../components/base/ConfirmModal';
 
 interface Role {
   id: string;
@@ -22,6 +22,14 @@ interface RolePermission {
   permission_id: string;
 }
 
+// Popup state interface
+interface PopupState {
+  isOpen: boolean;
+  type: 'success' | 'warning' | 'error' | 'info';
+  title: string;
+  message: string;
+}
+
 export default function RolesPage() {
   const { can, loading: permissionsLoading, orgId } = usePermissions();
   const [roles, setRoles] = useState<Role[]>([]);
@@ -38,10 +46,35 @@ export default function RolesPage() {
   });
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [roleToDelete, setRoleToDelete] = useState<Role | null>(null);
+  
+  // Popup state
+  const [popup, setPopup] = useState<PopupState>({
+    isOpen: false,
+    type: 'success',
+    title: '',
+    message: ''
+  });
 
-  const canCreate = can('roles:create');
-  const canEdit = can('roles:update');
-  const canDelete = can('roles:delete');
+  const showPopup = (type: PopupState['type'], title: string, message: string) => {
+    setPopup({ isOpen: true, type, title, message });
+  };
+
+  const closePopup = () => {
+    setPopup(prev => ({ ...prev, isOpen: false }));
+  };
+
+  // ✅ CORRECCIÓN PROBLEMA 1: Usar formato correcto con puntos (admin.roles.xxx)
+  const canCreate = can('admin.roles.create');
+  const canEdit = can('admin.roles.update');
+  const canDelete = can('admin.roles.delete');
+
+  console.log('[RolesPage] Permisos evaluados', {
+    canCreate,
+    canEdit,
+    canDelete,
+    orgId,
+    permissionsLoading
+  });
 
   useEffect(() => {
     if (!permissionsLoading && orgId) {
@@ -68,20 +101,51 @@ export default function RolesPage() {
   const loadRoles = async () => {
     try {
       setLoading(true);
-      const { data, error } = await supabase
+      
+      // ✅ CORRECCIÓN PROBLEMA 2: Query correcta con count hint
+      // Paso 1: Obtener todos los roles
+      const { data: rolesData, error: rolesError } = await supabase
         .from('roles')
-        .select(`
-          *,
-          user_org_roles(count)
-        `)
+        .select('*')
         .order('name');
 
-      if (error) throw error;
+      if (rolesError) throw rolesError;
 
-      const formattedRoles = data?.map((role: any) => ({
+      console.log('[RolesPage] Roles cargados', { count: rolesData?.length || 0 });
+
+      // Paso 2: Contar usuarios por rol con filtro de organización
+      const { data: countsData, error: countsError } = await supabase
+        .from('user_org_roles')
+        .select('role_id, org_id')
+        .eq('org_id', orgId);
+
+      if (countsError) {
+        console.error('[RolesPage] Error al contar usuarios:', countsError);
+      }
+
+      console.log('[RolesPage] Conteos obtenidos', { 
+        totalRecords: countsData?.length || 0,
+        orgId 
+      });
+
+      // Paso 3: Agrupar conteos por role_id
+      const countsByRole = (countsData || []).reduce((acc, record) => {
+        acc[record.role_id] = (acc[record.role_id] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+
+      console.log('[RolesPage] Conteos agrupados', countsByRole);
+
+      // Paso 4: Combinar roles con sus conteos
+      const formattedRoles = (rolesData || []).map((role) => ({
         ...role,
-        user_count: role.user_org_roles?.[0]?.count || 0
-      })) || [];
+        user_count: countsByRole[role.id] || 0
+      }));
+
+      console.log('[RolesPage] Roles formateados', {
+        total: formattedRoles.length,
+        sample: formattedRoles.slice(0, 3).map(r => ({ name: r.name, count: r.user_count }))
+      });
 
       setRoles(formattedRoles);
     } catch (error) {
@@ -137,6 +201,7 @@ export default function RolesPage() {
           .eq('id', editingRole.id);
 
         if (error) throw error;
+        showPopup('success', 'Rol actualizado', `El rol "${formData.name}" se ha actualizado correctamente.`);
       } else {
         const { error } = await supabase
           .from('roles')
@@ -146,6 +211,7 @@ export default function RolesPage() {
           });
 
         if (error) throw error;
+        showPopup('success', 'Rol creado', `El rol "${formData.name}" se ha creado correctamente.`);
       }
 
       setShowModal(false);
@@ -154,7 +220,7 @@ export default function RolesPage() {
       loadRoles();
     } catch (error: any) {
       console.error('[RolesPage] Error saving role:', error);
-      alert(error.message || 'Error al guardar el rol');
+      showPopup('error', 'Error al guardar', error.message || 'No se pudo guardar el rol. Intenta nuevamente.');
     }
   };
 
@@ -183,12 +249,16 @@ export default function RolesPage() {
 
       if (error) throw error;
       
+      const roleName = roleToDelete.name;
       setShowDeleteModal(false);
       setRoleToDelete(null);
       loadRoles();
-    } catch (error) {
+      showPopup('success', 'Rol eliminado', `El rol "${roleName}" se ha eliminado correctamente.`);
+    } catch (error: any) {
       console.error('[RolesPage] Error deleting role:', error);
-      alert('Error al eliminar el rol');
+      setShowDeleteModal(false);
+      setRoleToDelete(null);
+      showPopup('error', 'Error al eliminar', error.message || 'No se pudo eliminar el rol. Puede que tenga usuarios asignados.');
     }
   };
 
@@ -230,12 +300,14 @@ export default function RolesPage() {
         if (error) throw error;
       }
 
+      const roleName = selectedRole.name;
       setShowPermissionsModal(false);
       setSelectedRole(null);
       setSelectedPermissions([]);
-    } catch (error) {
+      showPopup('success', 'Permisos guardados', `Los permisos del rol "${roleName}" se han actualizado correctamente.`);
+    } catch (error: any) {
       console.error('[RolesPage] Error saving permissions:', error);
-      alert('Error al guardar los permisos');
+      showPopup('error', 'Error al guardar permisos', error.message || 'No se pudieron guardar los permisos. Intenta nuevamente.');
     }
   };
 
@@ -290,68 +362,91 @@ export default function RolesPage() {
         )}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {safeRoles.map((role) => (
-          <div
-            key={role.id}
-            className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 hover:shadow-md transition-shadow"
-          >
-            <div className="flex items-start justify-between mb-4">
-              <div className="w-12 h-12 rounded-lg bg-teal-100 flex items-center justify-center">
-                <i className="ri-shield-user-line text-teal-600 text-xl"></i>
-              </div>
-              <div className="flex gap-1">
-                {canEdit && (
-                  <button
-                    onClick={() => handleEdit(role)}
-                    className="w-8 h-8 flex items-center justify-center text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                    title="Editar"
-                  >
-                    <i className="ri-edit-line"></i>
-                  </button>
-                )}
-                {canDelete && (
-                  <button
-                    onClick={() => confirmDelete(role)}
-                    className="w-8 h-8 flex items-center justify-center text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                    title="Eliminar"
-                  >
-                    <i className="ri-delete-bin-line"></i>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <h3 className="text-lg font-bold text-gray-900 mb-2">{role.name}</h3>
-            <p className="text-sm text-gray-600 mb-4 line-clamp-2">{role.description}</p>
-
-            <div className="flex items-center justify-between text-sm text-gray-500 mb-4">
-              <span className="flex items-center gap-1">
-                <i className="ri-user-line"></i>
-                {role.user_count} usuarios
-              </span>
-              <span>{formatDate(role.created_at)}</span>
-            </div>
-
-            {canEdit && (
-              <button
-                onClick={() => handleManagePermissions(role)}
-                className="w-full px-4 py-2 border border-teal-600 text-teal-600 rounded-lg hover:bg-teal-50 transition-colors whitespace-nowrap"
-              >
-                <i className="ri-key-line mr-2"></i>
-                Gestionar Permisos
-              </button>
-            )}
-          </div>
-        ))}
-      </div>
-
-      {safeRoles.length === 0 && (
-        <div className="text-center py-12 bg-white rounded-lg border border-gray-200">
-          <i className="ri-shield-user-line text-4xl text-gray-300 mb-3"></i>
-          <p className="text-gray-500">No hay roles registrados</p>
+      <div className="bg-white rounded-lg border border-gray-200 shadow-sm overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200">
+                <th className="text-left px-6 py-3 font-semibold text-gray-700">Rol</th>
+                <th className="text-left px-6 py-3 font-semibold text-gray-700">Descripción</th>
+                <th className="text-center px-6 py-3 font-semibold text-gray-700">Usuarios</th>
+                <th className="text-left px-6 py-3 font-semibold text-gray-700">Creado</th>
+                <th className="text-right px-6 py-3 font-semibold text-gray-700">Acciones</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {safeRoles.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="px-6 py-16 text-center">
+                    <div className="flex flex-col items-center">
+                      <div className="w-12 h-12 flex items-center justify-center rounded-full bg-gray-100 mb-3">
+                        <i className="ri-shield-user-line text-2xl text-gray-400"></i>
+                      </div>
+                      <p className="text-gray-500">No hay roles registrados</p>
+                    </div>
+                  </td>
+                </tr>
+              ) : (
+                safeRoles.map((role) => (
+                  <tr key={role.id} className="hover:bg-gray-50/60 transition-colors">
+                    <td className="px-6 py-4">
+                      <div className="flex items-center gap-3">
+                        <div className="w-9 h-9 rounded-lg bg-teal-50 flex items-center justify-center flex-shrink-0">
+                          <i className="ri-shield-user-line text-teal-600"></i>
+                        </div>
+                        <span className="font-semibold text-gray-900">{role.name}</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <span className="text-gray-600 line-clamp-1 max-w-xs">{role.description || '—'}</span>
+                    </td>
+                    <td className="px-6 py-4 text-center">
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-gray-100 text-gray-700 text-xs font-medium">
+                        <i className="ri-user-line text-xs"></i>
+                        {role.user_count}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-gray-500">
+                      {formatDate(role.created_at)}
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center justify-end gap-1">
+                        {canEdit && (
+                          <button
+                            onClick={() => handleManagePermissions(role)}
+                            className="w-8 h-8 flex items-center justify-center text-teal-600 hover:bg-teal-50 rounded-lg transition-colors cursor-pointer"
+                            title="Gestionar Permisos"
+                          >
+                            <i className="ri-key-line"></i>
+                          </button>
+                        )}
+                        {canEdit && (
+                          <button
+                            onClick={() => handleEdit(role)}
+                            className="w-8 h-8 flex items-center justify-center text-amber-600 hover:bg-amber-50 rounded-lg transition-colors cursor-pointer"
+                            title="Editar"
+                          >
+                            <i className="ri-edit-line"></i>
+                          </button>
+                        )}
+                        {canDelete && (
+                          <button
+                            onClick={() => confirmDelete(role)}
+                            className="w-8 h-8 flex items-center justify-center text-red-500 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                            title="Eliminar"
+                          >
+                            <i className="ri-delete-bin-line"></i>
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
-      )}
+      </div>
 
       {/* Modal Crear/Editar Rol */}
       {showModal && (
@@ -517,6 +612,16 @@ export default function RolesPage() {
           </div>
         </div>
       )}
+
+      {/* Popup de notificaciones */}
+      <ConfirmModal
+        isOpen={popup.isOpen}
+        type={popup.type}
+        title={popup.title}
+        message={popup.message}
+        onConfirm={closePopup}
+        confirmText="Aceptar"
+      />
     </div>
   );
 }

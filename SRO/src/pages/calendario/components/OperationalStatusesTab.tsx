@@ -1,344 +1,558 @@
 import { useState, useEffect } from 'react';
+import { useAuth } from '../../../contexts/AuthContext';
+import { usePermissions } from '../../../hooks/usePermissions';
 import { operationalStatusService } from '../../../services/operationalStatusService';
-import type { OperationalStatus, CreateOperationalStatusDto } from '../../../types/operationalStatus';
+import type { OperationalStatus } from '../../../types/operationalStatus';
+import { ConfirmModal } from '../../../components/base/ConfirmModal';
 
-interface OperationalStatusesTabProps {
-  orgId: string;
+interface StatusModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSave: (status: Partial<OperationalStatus>) => void;
+  status: OperationalStatus | null;
 }
 
-export default function OperationalStatusesTab({ orgId }: OperationalStatusesTabProps) {
-  const [statuses, setStatuses] = useState<OperationalStatus[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [showModal, setShowModal] = useState(false);
-  const [editingStatus, setEditingStatus] = useState<OperationalStatus | null>(null);
-  const [formData, setFormData] = useState<CreateOperationalStatusDto>({
+function StatusModal({ isOpen, onClose, onSave, status }: StatusModalProps) {
+  const [formData, setFormData] = useState<Partial<OperationalStatus>>({
     name: '',
     code: '',
-    color: '#6B7280',
+    color: '#3B82F6',
     order_index: 0,
+    is_active: true,
   });
 
   useEffect(() => {
-    loadStatuses();
-  }, [orgId]);
-
-  const loadStatuses = async () => {
-    try {
-      setLoading(true);
-      const data = await operationalStatusService.getAll(orgId);
-      setStatuses(data);
-    } catch (error) {
-      console.error('Error cargando estados:', error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleOpenModal = (status?: OperationalStatus) => {
     if (status) {
-      setEditingStatus(status);
       setFormData({
         name: status.name,
         code: status.code,
         color: status.color,
         order_index: status.order_index,
+        is_active: status.is_active,
       });
     } else {
-      setEditingStatus(null);
       setFormData({
         name: '',
         code: '',
-        color: '#6B7280',
-        order_index: statuses.length,
+        color: '#3B82F6',
+        order_index: 0,
+        is_active: true,
       });
     }
-    setShowModal(true);
+  }, [status, isOpen]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSave(formData);
   };
 
-  const handleCloseModal = () => {
-    setShowModal(false);
-    setEditingStatus(null);
-    setFormData({
-      name: '',
-      code: '',
-      color: '#6B7280',
-      order_index: 0,
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-lg p-6 w-full max-w-md">
+        <h3 className="text-lg font-semibold mb-4">
+          {status ? 'Editar Estado' : 'Nuevo Estado'}
+        </h3>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Nombre</label>
+            <input
+              type="text"
+              value={formData.name || ''}
+              onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              className="w-full px-3 py-2 border rounded-lg"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Código</label>
+            <input
+              type="text"
+              value={formData.code || ''}
+              onChange={(e) => setFormData({ ...formData, code: e.target.value.toUpperCase() })}
+              className="w-full px-3 py-2 border rounded-lg"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Color</label>
+            <input
+              type="color"
+              value={formData.color || '#3B82F6'}
+              onChange={(e) => setFormData({ ...formData, color: e.target.value })}
+              className="w-full h-10 border rounded-lg cursor-pointer"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Orden</label>
+            <input
+              type="number"
+              value={formData.order_index || 0}
+              onChange={(e) => setFormData({ ...formData, order_index: parseInt(e.target.value, 10) })}
+              className="w-full px-3 py-2 border rounded-lg"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="is_active"
+              checked={formData.is_active ?? true}
+              onChange={(e) => setFormData({ ...formData, is_active: e.target.checked })}
+              className="w-4 h-4 cursor-pointer"
+            />
+            <label htmlFor="is_active" className="text-sm font-medium cursor-pointer">
+              Activo
+            </label>
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 border rounded-lg hover:bg-gray-50 whitespace-nowrap"
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 whitespace-nowrap"
+            >
+              Guardar
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export default function OperationalStatusesTab() {
+  const { user } = useAuth();
+  const { orgId, can } = usePermissions();
+
+  const [statuses, setStatuses] = useState<OperationalStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [statusInUseMap, setStatusInUseMap] = useState<Record<string, boolean>>({});
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingStatus, setEditingStatus] = useState<OperationalStatus | null>(null);
+
+  const [confirmModal, setConfirmModal] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    type: 'success' | 'warning' | 'error' | 'info';
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    onConfirm: () => {},
+    type: 'warning',
+  });
+
+  const [doubleConfirmModal, setDoubleConfirmModal] = useState<{
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+  }>({
+    isOpen: false,
+    title: '',
+    message: '',
+    onConfirm: () => {},
+  });
+
+  const hasFullAccess = can('admin.matrix.update');
+
+  useEffect(() => {
+    if (!orgId) {
+      setLoading(false);
+      return;
+    }
+    loadStatuses();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orgId]);
+
+  const loadStatuses = async () => {
+    if (!orgId) return;
+
+    try {
+      setLoading(true);
+      setError(null);
+
+      const data = await operationalStatusService.getStatuses(orgId);
+      setStatuses(data);
+
+      const inUseMap: Record<string, boolean> = {};
+      await Promise.all(
+        data.map(async (status) => {
+          const inUse = await operationalStatusService.isStatusInUse(status.id, orgId);
+          inUseMap[status.id] = inUse;
+        })
+      );
+      setStatusInUseMap(inUseMap);
+    } catch (err: any) {
+      console.error('Failed to load statuses', err);
+      setError(err?.message ?? 'Error al cargar estados');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSave = async (statusData: Partial<OperationalStatus>) => {
+    if (!orgId) return;
+
+    try {
+      if (editingStatus) {
+        await operationalStatusService.updateStatus(editingStatus.id, statusData);
+      } else {
+        await operationalStatusService.createStatus({ ...statusData, org_id: orgId });
+      }
+      setIsModalOpen(false);
+      setEditingStatus(null);
+      loadStatuses();
+    } catch (err: any) {
+      console.error('Error saving status:', err);
+      alert(err?.message ?? 'Error al guardar estado');
+    }
+  };
+
+  const handleToggleActive = (status: OperationalStatus) => {
+    const isInUse = statusInUseMap[status.id];
+    const isProtected = ['PENDING', 'DISPATCHED', 'ARRIVED_PENDING_UNLOAD'].includes(status.code);
+
+    if (isInUse && !hasFullAccess) {
+      alert('Este estado está en uso por reglas de correspondencia y no puede ser modificado.');
+      return;
+    }
+
+    if (isInUse && hasFullAccess) {
+      setConfirmModal({
+        isOpen: true,
+        title: 'Estado en uso',
+        message: `Este estado está en uso por reglas de correspondencia. ¿Estás seguro de que deseas ${status.is_active ? 'inactivarlo' : 'activarlo'}?`,
+        type: 'warning',
+        onConfirm: () => {
+          setConfirmModal((c) => ({ ...c, isOpen: false }));
+          setDoubleConfirmModal({
+            isOpen: true,
+            title: 'Última advertencia',
+            message: 'Esto puede afectar las configuraciones existentes. ¿Confirmar cambio?',
+            onConfirm: async () => {
+              setDoubleConfirmModal((c) => ({ ...c, isOpen: false }));
+              await operationalStatusService.updateStatus(status.id, {
+                is_active: !status.is_active,
+              });
+              loadStatuses();
+            },
+          });
+        },
+      });
+      return;
+    }
+
+    setConfirmModal({
+      isOpen: true,
+      title: status.is_active ? 'Inactivar estado' : 'Activar estado',
+      message: `¿Estás seguro de que deseas ${status.is_active ? 'inactivar' : 'activar'} este estado?`,
+      type: 'warning',
+      onConfirm: async () => {
+        setConfirmModal((c) => ({ ...c, isOpen: false }));
+        await operationalStatusService.updateStatus(status.id, {
+          is_active: !status.is_active,
+        });
+        loadStatuses();
+      },
     });
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      if (editingStatus) {
-        await operationalStatusService.update(editingStatus.id, formData);
-      } else {
-        await operationalStatusService.create(orgId, formData);
-      }
-      await loadStatuses();
-      handleCloseModal();
-    } catch (error) {
-      console.error('Error guardando estado:', error);
-      alert('Error al guardar el estado operativo');
+  const handleDelete = (status: OperationalStatus) => {
+    const isInUse = statusInUseMap[status.id];
+
+    if (isInUse && !hasFullAccess) {
+      alert('Este estado está en uso por reglas de correspondencia y no puede ser eliminado.');
+      return;
     }
+
+    if (isInUse && hasFullAccess) {
+      setConfirmModal({
+        isOpen: true,
+        title: 'Estado en uso',
+        message: 'Este estado está en uso por reglas de correspondencia. ¿Estás seguro de que deseas eliminarlo?',
+        type: 'error',
+        onConfirm: () => {
+          setConfirmModal((c) => ({ ...c, isOpen: false }));
+          setDoubleConfirmModal({
+            isOpen: true,
+            title: 'Última advertencia',
+            message: 'Esto puede romper configuraciones existentes. ¿Confirmar eliminación?',
+            onConfirm: async () => {
+              setDoubleConfirmModal((c) => ({ ...c, isOpen: false }));
+              await operationalStatusService.deleteStatus(status.id);
+              loadStatuses();
+            },
+          });
+        },
+      });
+      return;
+    }
+
+    setConfirmModal({
+      isOpen: true,
+      title: 'Eliminar estado',
+      message: '¿Estás seguro de que deseas eliminar este estado?',
+      type: 'error',
+      onConfirm: async () => {
+        setConfirmModal((c) => ({ ...c, isOpen: false }));
+        await operationalStatusService.deleteStatus(status.id);
+        loadStatuses();
+      },
+    });
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('¿Estás seguro de eliminar este estado operativo?')) return;
-    
-    try {
-      await operationalStatusService.delete(id);
-      await loadStatuses();
-    } catch (error) {
-      console.error('Error eliminando estado:', error);
-      alert('Error al eliminar el estado operativo');
+  const handleEdit = (status: OperationalStatus) => {
+    const isInUse = statusInUseMap[status.id];
+
+    if (isInUse && !hasFullAccess) {
+      alert('Este estado está en uso por reglas de correspondencia y no puede ser editado.');
+      return;
     }
+
+    setEditingStatus(status);
+    setIsModalOpen(true);
   };
 
-  const handleMoveUp = async (index: number) => {
-    if (index === 0) return;
-    
-    const newStatuses = [...statuses];
-    [newStatuses[index - 1], newStatuses[index]] = [newStatuses[index], newStatuses[index - 1]];
-    
-    const updates = newStatuses.map((status, idx) => ({
-      id: status.id,
-      order_index: idx,
-    }));
+  if (error) {
+    return (
+      <div className="p-6">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <i className="ri-error-warning-line text-red-600 text-xl"></i>
+            <div className="flex-1">
+              <h3 className="font-semibold text-red-900 mb-1">Error al cargar estados</h3>
+              <p className="text-sm text-red-700">{error}</p>
+              {orgId && <p className="text-xs text-red-600 mt-2">org_id usado: {orgId}</p>}
+            </div>
+          </div>
+          <button
+            onClick={loadStatuses}
+            className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm whitespace-nowrap"
+          >
+            Reintentar
+          </button>
+        </div>
+      </div>
+    );
+  }
 
-    try {
-      await operationalStatusService.reorder(updates);
-      setStatuses(newStatuses);
-    } catch (error) {
-      console.error('Error reordenando:', error);
-    }
-  };
-
-  const handleMoveDown = async (index: number) => {
-    if (index === statuses.length - 1) return;
-    
-    const newStatuses = [...statuses];
-    [newStatuses[index], newStatuses[index + 1]] = [newStatuses[index + 1], newStatuses[index]];
-    
-    const updates = newStatuses.map((status, idx) => ({
-      id: status.id,
-      order_index: idx,
-    }));
-
-    try {
-      await operationalStatusService.reorder(updates);
-      setStatuses(newStatuses);
-    } catch (error) {
-      console.error('Error reordenando:', error);
-    }
-  };
+  if (!orgId) {
+    return (
+      <div className="p-6">
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <i className="ri-alert-line text-yellow-600 text-xl"></i>
+            <div className="flex-1">
+              <h3 className="font-semibold text-yellow-900 mb-1">No se pudo resolver org_id</h3>
+              <p className="text-sm text-yellow-700">
+                El usuario no tiene una organización asignada. Contactá al administrador.
+              </p>
+              <p className="text-xs text-yellow-600 mt-2">Diagnóstico: org_id = null</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-12">
-        <i className="ri-loader-4-line text-3xl text-teal-600 animate-spin"></i>
+      <div className="p-6 flex items-center justify-center">
+        <div className="text-center">
+          <i className="ri-loader-4-line text-3xl text-teal-600 animate-spin"></i>
+          <p className="text-sm text-gray-600 mt-2">Cargando estados...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (statuses.length === 0) {
+    return (
+      <div className="p-6">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-lg font-semibold">Estados Operativos</h3>
+          <button
+            onClick={() => {
+              setEditingStatus(null);
+              setIsModalOpen(true);
+            }}
+            className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 whitespace-nowrap"
+          >
+            <i className="ri-add-line mr-2"></i>
+            Nuevo Estado
+          </button>
+        </div>
+        <div className="bg-gray-50 border border-gray-200 rounded-lg p-8 text-center">
+          <i className="ri-list-check text-4xl text-gray-400 mb-3"></i>
+          <h3 className="font-semibold text-gray-700 mb-1">No hay estados configurados</h3>
+          <p className="text-sm text-gray-600">Creá tu primer estado operativo para comenzar.</p>
+          <p className="text-xs text-gray-500 mt-2">org_id: {orgId}</p>
+        </div>
+        <StatusModal
+          isOpen={isModalOpen}
+          onClose={() => {
+            setIsModalOpen(false);
+            setEditingStatus(null);
+          }}
+          onSave={handleSave}
+          status={editingStatus}
+        />
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-gray-900">Estados Operativos</h2>
-          <p className="text-sm text-gray-600 mt-1">
-            Gestiona los estados operativos disponibles para las reservas
-          </p>
-        </div>
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-lg font-semibold">Estados Operativos</h3>
         <button
-          onClick={() => handleOpenModal()}
-          className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors flex items-center gap-2 whitespace-nowrap"
+          onClick={() => {
+            setEditingStatus(null);
+            setIsModalOpen(true);
+          }}
+          className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 whitespace-nowrap"
         >
-          <i className="ri-add-line"></i>
+          <i className="ri-add-line mr-2"></i>
           Nuevo Estado
         </button>
       </div>
 
-      {/* Lista de estados */}
-      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+      <div className="bg-white rounded-lg border overflow-hidden">
         <table className="w-full">
-          <thead className="bg-gray-50 border-b border-gray-200">
+          <thead className="bg-gray-50 border-b">
             <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Orden
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Color
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Nombre
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Código
-              </th>
-              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Acciones
-              </th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Orden</th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Color</th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Nombre</th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Código</th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Estado</th>
+              <th className="px-4 py-3 text-left text-sm font-semibold">Acciones</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-200">
-            {statuses.map((status, index) => (
-              <tr key={status.id} className="hover:bg-gray-50">
-                <td className="px-6 py-4 whitespace-nowrap">
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => handleMoveUp(index)}
-                      disabled={index === 0}
-                      className="w-6 h-6 flex items-center justify-center text-gray-400 hover:text-gray-600 disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <i className="ri-arrow-up-s-line"></i>
-                    </button>
-                    <button
-                      onClick={() => handleMoveDown(index)}
-                      disabled={index === statuses.length - 1}
-                      className="w-6 h-6 flex items-center justify-center text-gray-400 hover:text-gray-600 disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <i className="ri-arrow-down-s-line"></i>
-                    </button>
-                    <span className="text-sm text-gray-500 ml-2">{index + 1}</span>
-                  </div>
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap">
-                  <div className="flex items-center gap-2">
-                    <div
-                      className="w-8 h-8 rounded-lg border border-gray-200"
-                      style={{ backgroundColor: status.color }}
-                    ></div>
-                    <span className="text-xs text-gray-500 font-mono">{status.color}</span>
-                  </div>
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap">
-                  <span className="text-sm font-medium text-gray-900">{status.name}</span>
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap">
-                  <span className="text-sm text-gray-600 font-mono">{status.code}</span>
-                </td>
-                <td className="px-6 py-4 whitespace-nowrap text-right">
-                  <div className="flex items-center justify-end gap-2">
-                    <button
-                      onClick={() => handleOpenModal(status)}
-                      className="w-8 h-8 flex items-center justify-center text-gray-600 hover:text-teal-600 hover:bg-teal-50 rounded-lg transition-colors"
-                      title="Editar"
-                    >
-                      <i className="ri-edit-line"></i>
-                    </button>
-                    <button
-                      onClick={() => handleDelete(status.id)}
-                      className="w-8 h-8 flex items-center justify-center text-gray-600 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                      title="Eliminar"
-                    >
-                      <i className="ri-delete-bin-line"></i>
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
+          <tbody className="divide-y">
+            {statuses.map((status) => {
+              const isInUse = statusInUseMap[status.id];
+              const canModify = !isInUse || hasFullAccess;
+
+              return (
+                <tr key={status.id} className="hover:bg-gray-50">
+                  <td className="px-4 py-3 text-sm">{status.order_index ?? '-'}</td>
+                  <td className="px-4 py-3">
+                    <div className="w-6 h-6 rounded border" style={{ backgroundColor: status.color }}></div>
+                  </td>
+                  <td className="px-4 py-3 text-sm font-medium">{status.name}</td>
+                  <td className="px-4 py-3 text-sm font-mono text-gray-600">{status.code}</td>
+                  <td className="px-4 py-3">
+                    <div className="flex gap-2">
+                      <span
+                        className={`px-2 py-1 rounded-full text-xs font-medium whitespace-nowrap ${
+                          status.is_active ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'
+                        }`}
+                      >
+                        {status.is_active ? 'Activo' : 'Inactivo'}
+                      </span>
+                      {isInUse && (
+                        <span className="px-2 py-1 rounded-full text-xs font-medium bg-yellow-100 text-yellow-700 whitespace-nowrap">
+                          En uso
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleEdit(status)}
+                        disabled={!canModify}
+                        title={!canModify ? 'En uso por reglas' : 'Editar'}
+                        className={`p-2 rounded hover:bg-gray-100 ${
+                          !canModify ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                        }`}
+                      >
+                        <i className="ri-edit-line text-blue-600"></i>
+                      </button>
+                      <button
+                        onClick={() => handleToggleActive(status)}
+                        disabled={!canModify}
+                        title={
+                          !canModify
+                            ? 'En uso por reglas'
+                            : status.is_active
+                            ? 'Inactivar'
+                            : 'Activar'
+                        }
+                        className={`p-2 rounded hover:bg-gray-100 ${
+                          !canModify ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                        }`}
+                      >
+                        <i
+                          className={`${
+                            status.is_active ? 'ri-toggle-line' : 'ri-toggle-fill'
+                          } text-teal-600`}
+                        ></i>
+                      </button>
+                      <button
+                        onClick={() => handleDelete(status)}
+                        disabled={!canModify}
+                        title={!canModify ? 'En uso por reglas' : 'Eliminar'}
+                        className={`p-2 rounded hover:bg-gray-100 ${
+                          !canModify ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                        }`}
+                      >
+                        <i className="ri-delete-bin-line text-red-600"></i>
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
-
-        {statuses.length === 0 && (
-          <div className="text-center py-12">
-            <i className="ri-list-check text-4xl text-gray-300 mb-3"></i>
-            <p className="text-gray-500">No hay estados operativos configurados</p>
-            <button
-              onClick={() => handleOpenModal()}
-              className="mt-4 text-teal-600 hover:text-teal-700 font-medium"
-            >
-              Crear el primero
-            </button>
-          </div>
-        )}
       </div>
 
-      {/* Modal */}
-      {showModal && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-xl shadow-xl max-w-md w-full">
-            <div className="px-6 py-4 border-b border-gray-200">
-              <h3 className="text-lg font-semibold text-gray-900">
-                {editingStatus ? 'Editar Estado Operativo' : 'Nuevo Estado Operativo'}
-              </h3>
-            </div>
+      <StatusModal
+        isOpen={isModalOpen}
+        onClose={() => {
+          setIsModalOpen(false);
+          setEditingStatus(null);
+        }}
+        onSave={handleSave}
+        status={editingStatus}
+      />
 
-            <form onSubmit={handleSubmit} className="p-6 space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Nombre *
-                </label>
-                <input
-                  type="text"
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent"
-                  placeholder="Ej: En Proceso"
-                  required
-                />
-              </div>
+      <ConfirmModal
+        isOpen={confirmModal.isOpen}
+        type={confirmModal.type}
+        title={confirmModal.title}
+        message={confirmModal.message}
+        confirmText="Confirmar"
+        cancelText="Cancelar"
+        onConfirm={confirmModal.onConfirm}
+        onCancel={() => setConfirmModal((c) => ({ ...c, isOpen: false }))}
+        showCancel={true}
+      />
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Código *
-                </label>
-                <input
-                  type="text"
-                  value={formData.code}
-                  onChange={(e) => setFormData({ ...formData, code: e.target.value.toLowerCase().replace(/\s+/g, '_') })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent font-mono"
-                  placeholder="Ej: in_progress"
-                  required
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Identificador único (sin espacios, minúsculas)
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Color *
-                </label>
-                <div className="flex items-center gap-3">
-                  <input
-                    type="color"
-                    value={formData.color}
-                    onChange={(e) => setFormData({ ...formData, color: e.target.value })}
-                    className="w-16 h-10 rounded-lg border border-gray-300 cursor-pointer"
-                  />
-                  <input
-                    type="text"
-                    value={formData.color}
-                    onChange={(e) => setFormData({ ...formData, color: e.target.value })}
-                    className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent font-mono"
-                    placeholder="#6B7280"
-                    pattern="^#[0-9A-Fa-f]{6}$"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="flex items-center justify-end gap-3 pt-4">
-                <button
-                  type="button"
-                  onClick={handleCloseModal}
-                  className="px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors whitespace-nowrap"
-                >
-                  Cancelar
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors whitespace-nowrap"
-                >
-                  {editingStatus ? 'Guardar Cambios' : 'Crear Estado'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <ConfirmModal
+        isOpen={doubleConfirmModal.isOpen}
+        type="error"
+        title={doubleConfirmModal.title}
+        message={doubleConfirmModal.message}
+        confirmText="Sí, confirmar"
+        cancelText="Cancelar"
+        onConfirm={doubleConfirmModal.onConfirm}
+        onCancel={() => setDoubleConfirmModal((c) => ({ ...c, isOpen: false }))}
+        showCancel={true}
+      />
     </div>
   );
 }

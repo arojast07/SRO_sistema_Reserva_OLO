@@ -3,6 +3,7 @@ import { usePermissions } from '../../../../hooks/usePermissions';
 import { cargoTypesService } from '../../../../services/cargoTypesService';
 import type { CargoType } from '../../../../types/catalog';
 import CargoTypeModal from './CargoTypeModal';
+import { ConfirmModal } from '../../../../components/base/ConfirmModal';
 
 interface CargoTypesTabProps {
   orgId: string;
@@ -18,6 +19,23 @@ export default function CargoTypesTab({ orgId }: CargoTypesTabProps) {
   const [showModal, setShowModal] = useState(false);
   const [editingCargoType, setEditingCargoType] = useState<CargoType | null>(null);
   const [showActiveOnly, setShowActiveOnly] = useState(true);
+
+  // Modal de confirmación
+  const [confirmModal, setConfirmModal] = useState<{
+    isOpen: boolean;
+    type: 'success' | 'warning' | 'error' | 'info';
+    title: string;
+    message: string;
+    showCancel?: boolean;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  }>({
+    isOpen: false,
+    type: 'info',
+    title: '',
+    message: '',
+    onConfirm: () => {}
+  });
 
   const canRead = can('cargo_types.view');
   const canCreate = can('cargo_types.create');
@@ -62,14 +80,32 @@ export default function CargoTypesTab({ orgId }: CargoTypesTabProps) {
   };
 
   const handleDelete = async (cargoType: CargoType) => {
-    if (!confirm(`¿Desactivar el tipo de carga "${cargoType.name}"?`)) return;
+    setConfirmModal({
+      isOpen: true,
+      type: 'warning',
+      title: 'Confirmar desactivación',
+      message: `¿Desactivar el tipo de carga "${cargoType.name}"?`,
+      showCancel: true,
+      onConfirm: () => confirmDelete(cargoType),
+      onCancel: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+    });
+  };
 
+  const confirmDelete = async (cargoType: CargoType) => {
+    setConfirmModal(prev => ({ ...prev, isOpen: false }));
+    
     try {
       await cargoTypesService.deleteCargoType(cargoType.id);
       await loadCargoTypes();
     } catch (err) {
       console.error('[CargoTypesTab] Error deleting', err);
-      alert('Error al desactivar tipo de carga');
+      setConfirmModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: 'Error al desactivar tipo de carga',
+        onConfirm: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+      });
     }
   };
 
@@ -217,6 +253,17 @@ export default function CargoTypesTab({ orgId }: CargoTypesTabProps) {
           onSave={handleSave}
         />
       )}
+
+      {/* Modal de confirmación */}
+      <ConfirmModal
+        isOpen={confirmModal.isOpen}
+        type={confirmModal.type}
+        title={confirmModal.title}
+        message={confirmModal.message}
+        showCancel={confirmModal.showCancel}
+        onConfirm={confirmModal.onConfirm}
+        onCancel={confirmModal.onCancel}
+      />
     </div>
   );
 }

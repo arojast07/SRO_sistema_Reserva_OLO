@@ -126,5 +126,94 @@ export const warehousesService = {
 
       throw error;
     }
+  },
+
+  /**
+   * Obtiene los IDs de clientes asignados a un almacén
+   */
+  async getWarehouseClients(orgId: string, warehouseId: string): Promise<string[]> {
+    console.log('[WarehousesService] getWarehouseClients', { orgId, warehouseId });
+
+    const { data, error } = await supabase
+      .from('warehouse_clients')
+      .select('client_id')
+      .eq('org_id', orgId)
+      .eq('warehouse_id', warehouseId);
+
+    if (error) {
+      console.error('[WarehousesService] getWarehouseClients error', error);
+      throw error;
+    }
+
+    return (data || []).map((row) => row.client_id);
+  },
+
+  /**
+   * Asigna clientes a un almacén (diff: inserta nuevos, elimina desmarcados)
+   */
+  async setWarehouseClients(orgId: string, warehouseId: string, clientIds: string[]): Promise<void> {
+    console.log('[WarehousesService] setWarehouseClients', { orgId, warehouseId, clientIds });
+
+    try {
+      // 1. Obtener asignaciones actuales
+      const current = await this.getWarehouseClients(orgId, warehouseId);
+      const currentSet = new Set(current);
+      const newSet = new Set(clientIds);
+
+      // 2. Calcular diff
+      const toInsert = clientIds.filter((id) => !currentSet.has(id));
+      const toDelete = current.filter((id) => !newSet.has(id));
+
+      console.log('[WarehousesService] setWarehouseClients diff', {
+        current: current.length,
+        new: clientIds.length,
+        toInsert: toInsert.length,
+        toDelete: toDelete.length,
+      });
+
+      // 3. Eliminar desmarcados
+      if (toDelete.length > 0) {
+        const { error: deleteError } = await supabase
+          .from('warehouse_clients')
+          .delete()
+          .eq('org_id', orgId)
+          .eq('warehouse_id', warehouseId)
+          .in('client_id', toDelete);
+
+        if (deleteError) {
+          console.error('[WarehousesService] delete error', deleteError);
+          throw deleteError;
+        }
+      }
+
+      // 4. Insertar nuevos
+      if (toInsert.length > 0) {
+        const rows = toInsert.map((clientId) => ({
+          org_id: orgId,
+          warehouse_id: warehouseId,
+          client_id: clientId,
+        }));
+
+        const { error: insertError } = await supabase
+          .from('warehouse_clients')
+          .insert(rows);
+
+        if (insertError) {
+          console.error('[WarehousesService] insert error', insertError);
+
+          // Manejar duplicados (por si acaso)
+          if (insertError.code === '23505') {
+            throw new Error('Algunos clientes ya están asignados a este almacén');
+          }
+
+          throw insertError;
+        }
+      }
+
+      console.log('[WarehousesService] setWarehouseClients success');
+    } catch (error) {
+      console.error('[WarehousesService] setWarehouseClients error', error);
+      throw error;
+    }
   }
 };

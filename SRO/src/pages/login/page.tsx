@@ -1,3 +1,4 @@
+
 import { useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
@@ -5,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
@@ -34,17 +36,20 @@ export default function Login() {
       <div className="flex-1 flex items-center justify-center px-6 py-12 bg-gradient-to-br from-teal-50 to-white">
         <div className="w-full max-w-md">
           <div className="text-center mb-8">
-            <img 
-              src="https://public.readdy.ai/ai/img_res/0a1a11aa-fee5-4fab-a8a4-9e0219e8d44e.png" 
-              alt="Logo" 
-              className="h-16 w-auto mx-auto mb-6"
+            <img
+              src="https://static.readdy.ai/image/96746b7ba583c55b81aa58d37fd022fd/894bf9da2b8030a7b0ba3c4dadd1585d.png"
+              alt="SRO Logo"
+              className="h-20 w-auto mx-auto mb-6 object-contain"
             />
-            <h1 className="text-3xl font-bold text-gray-900 mb-2">Sistema de Gestión de Andenes</h1>
+            <h1 className="text-3xl font-bold text-gray-900 mb-2">
+              Sistema de Reservas OLO
+            </h1>
             <p className="text-gray-600">Ingresa tus credenciales para continuar</p>
           </div>
 
           <div className="bg-white rounded-2xl shadow-lg p-8">
             <form onSubmit={handleSubmit} className="space-y-6">
+              {/* Email */}
               <div>
                 <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-2">
                   Correo Electrónico
@@ -65,6 +70,7 @@ export default function Login() {
                 </div>
               </div>
 
+              {/* Password */}
               <div>
                 <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-2">
                   Contraseña
@@ -75,16 +81,28 @@ export default function Login() {
                   </div>
                   <input
                     id="password"
-                    type="password"
+                    type={showPassword ? 'text' : 'password'}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    className="block w-full pl-10 pr-3 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm"
+                    className="block w-full pl-10 pr-10 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm"
                     placeholder="••••••••"
                     required
                   />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute inset-y-0 right-0 pr-3 flex items-center cursor-pointer text-gray-400 hover:text-gray-600 transition-colors"
+                  >
+                    <i
+                      className={`${
+                        showPassword ? 'ri-eye-off-line' : 'ri-eye-line'
+                      } w-5 h-5 flex items-center justify-center`}
+                    ></i>
+                  </button>
                 </div>
               </div>
 
+              {/* Error message */}
               {error && (
                 <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
                   <i className="ri-error-warning-line w-5 h-5 flex items-center justify-center"></i>
@@ -92,6 +110,7 @@ export default function Login() {
                 </div>
               )}
 
+              {/* Submit button */}
               <button
                 type="submit"
                 disabled={loading}
@@ -101,11 +120,13 @@ export default function Login() {
               </button>
             </form>
 
+            {/* Note section */}
             <div className="mt-6 pt-6 border-t border-gray-200">
               <div className="text-sm text-gray-600">
                 <p className="font-medium text-gray-900 mb-3">Nota:</p>
                 <p className="bg-teal-50 p-3 rounded-lg text-teal-800">
-                  Debes crear usuarios en Supabase Authentication y asignarles roles en la tabla <code className="bg-teal-100 px-1 rounded">user_org_roles</code> para poder iniciar sesión.
+                  En caso de no poseer un usuario debes solicitarlo al administrador{' '}
+                  <code className="bg-teal-100 px-1 rounded">correo@ologistics.com</code> para poder iniciar sesión.
                 </p>
               </div>
             </div>
@@ -113,11 +134,13 @@ export default function Login() {
         </div>
       </div>
 
+      {/* Right side illustration */}
       <div className="hidden lg:flex flex-1 bg-gradient-to-br from-teal-600 to-teal-800 items-center justify-center p-12">
         <div className="max-w-lg text-white">
           <h2 className="text-4xl font-bold mb-6">Gestión Eficiente de Andenes</h2>
           <p className="text-xl text-teal-100 mb-8">
-            Optimiza la coordinación de llegadas y descargas de camiones con nuestro sistema integral de reservaciones.
+            Optimiza la coordinación de llegadas, descargas y salidas de camiones con nuestro sistema
+            integral de reservaciones.
           </p>
           <div className="space-y-4">
             <div className="flex items-start gap-3">

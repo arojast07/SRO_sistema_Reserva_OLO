@@ -1,10 +1,12 @@
 import { useState, useEffect } from 'react';
 import { usePermissions } from '../../../hooks/usePermissions';
 import { warehousesService } from '../../../services/warehousesService';
+import { clientsService } from '../../../services/clientsService';
 import { Warehouse, WarehouseFormData } from '../../../types/warehouse';
+import type { Client } from '../../../types/client';
 import WarehouseModal from './components/WarehouseModal';
 import CountriesModal from './components/CountriesModal';
-
+import { ConfirmModal } from '../../../components/base/ConfirmModal';
 
 import type { Country } from '../../../types/catalog';
 import { countriesService } from '../../../services/countriesService';
@@ -21,6 +23,9 @@ export default function AlmacenesPage() {
   const [selectedCountryId, setSelectedCountryId] = useState<string>('all');
   const [loadingCountries, setLoadingCountries] = useState(false);
   const [showCountriesModal, setShowCountriesModal] = useState(false);
+  // Clientes
+  const [clients, setClients] = useState<Client[]>([]);
+  const [assignedClientIds, setAssignedClientIds] = useState<string[]>([]);
   // Filtros
   const [searchTerm, setSearchTerm] = useState('');
 
@@ -31,6 +36,26 @@ export default function AlmacenesPage() {
   // Toast de éxito
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
+  // Modal de confirmación/error
+  const [confirmModal, setConfirmModal] = useState<{
+    isOpen: boolean;
+    type: 'success' | 'warning' | 'error' | 'info';
+    title: string;
+    message: string;
+    showCancel?: boolean;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  }>({
+    isOpen: false,
+    type: 'info',
+    title: '',
+    message: '',
+    onConfirm: () => {}
+  });
+
+  // Estado para eliminación pendiente
+  const [pendingDeleteWarehouse, setPendingDeleteWarehouse] = useState<Warehouse | null>(null);
+
   console.log('[AlmacenesPage] snapshot', {
     orgId,
     userId,
@@ -38,20 +63,35 @@ export default function AlmacenesPage() {
     warehousesCount: warehouses.length,
   });
 
-    const loadCountries = async () => {
-      if (!orgId) return;
-      try {
-        setLoadingCountries(true);
-        const data = await countriesService.getAll(orgId);
-        setCountries(data || []);
-      } catch (e) {
-        console.error('[AlmacenesPage] loadCountries error', e);
-        setCountries([]);
-      } finally {
-        setLoadingCountries(false);
-      }
-    };
+  const loadCountries = async () => {
+    if (!orgId) return;
+    try {
+      setLoadingCountries(true);
+      const data = await countriesService.getAll(orgId);
+      setCountries(data || []);
+    } catch (e) {
+      console.error('[AlmacenesPage] loadCountries error', e);
+      setCountries([]);
+    } finally {
+      setLoadingCountries(false);
+    }
+  };
 
+  const loadClients = async () => {
+    if (!orgId) return;
+    try {
+      console.log('[AlmacenesPage] 🔍 loadClients START', { orgId });
+      const data = await clientsService.listClients(orgId);
+      console.log('[AlmacenesPage] ✅ loadClients SUCCESS', { 
+        count: data?.length || 0,
+        clients: data?.map(c => ({ id: c.id, name: c.name, is_active: c.is_active }))
+      });
+      setClients(data || []);
+    } catch (e) {
+      console.error('[AlmacenesPage] ❌ loadClients error', e);
+      setClients([]);
+    }
+  };
 
   const loadWarehouses = async () => {
     if (!orgId) return;
@@ -76,8 +116,13 @@ export default function AlmacenesPage() {
 
   useEffect(() => {
     if (!permissionsLoading && orgId) {
-      console.log('[AlmacenesPage] loading warehouses & countries...');
+      console.log('[AlmacenesPage] 🚀 Initializing - loading data...', {
+        orgId,
+        userId,
+        permissionsLoaded: !permissionsLoading
+      });
       loadCountries();
+      loadClients();
       loadWarehouses();
     }
   }, [permissionsLoading, orgId]);
@@ -102,43 +147,109 @@ export default function AlmacenesPage() {
     setFilteredWarehouses(result);
   }, [searchTerm, warehouses, selectedCountryId]);
 
-  const handleCreate = () => {
+  const handleCreate = async () => {
     if (!can('warehouses.create')) {
-      alert('No tienes permisos para crear almacenes');
+      setConfirmModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Sin permisos',
+        message: 'No tienes permisos para crear almacenes',
+        onConfirm: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+      });
       return;
     }
     setEditingWarehouse(null);
+    setAssignedClientIds([]);
+    
+    console.log('[AlmacenesPage] 🆕 handleCreate - Opening modal', {
+      clientsCount: clients.length,
+      activeClientsCount: clients.filter(c => c.is_active).length,
+      canManageClients: can('admin.warehouses.update') || can('warehouses.update') || can('admin.warehouses.clients.manage')
+    });
+    
     setShowModal(true);
   };
 
-  const handleEdit = (warehouse: Warehouse) => {
+  const handleEdit = async (warehouse: Warehouse) => {
     if (!can('warehouses.update')) {
-      alert('No tienes permisos para editar almacenes');
+      setConfirmModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Sin permisos',
+        message: 'No tienes permisos para editar almacenes',
+        onConfirm: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+      });
       return;
     }
+
+    // Cargar clientes asignados
+    try {
+      console.log('[AlmacenesPage] 📝 handleEdit - Loading warehouse clients', { warehouseId: warehouse.id });
+      const clientIds = await warehousesService.getWarehouseClients(orgId!, warehouse.id);
+      console.log('[AlmacenesPage] ✅ Warehouse clients loaded', { count: clientIds.length, clientIds });
+      setAssignedClientIds(clientIds);
+    } catch (error) {
+      console.error('[AlmacenesPage] ❌ loadWarehouseClients error', error);
+      setAssignedClientIds([]);
+    }
+
     setEditingWarehouse(warehouse);
+    
+    console.log('[AlmacenesPage] 📝 handleEdit - Opening modal', {
+      warehouseName: warehouse.name,
+      clientsCount: clients.length,
+      assignedCount: assignedClientIds.length,
+      canManageClients: can('admin.warehouses.update') || can('warehouses.update') || can('admin.warehouses.clients.manage')
+    });
+    
     setShowModal(true);
   };
 
-  const handleSave = async (formData: WarehouseFormData) => {
+  const handleSave = async (formData: WarehouseFormData, clientIds: string[]) => {
     if (!orgId) throw new Error('No hay organización seleccionada');
 
-    console.log('[AlmacenesPage] handleSave', {
+    console.log('[AlmacenesPage] 💾 handleSave', {
       mode: editingWarehouse ? 'update' : 'create',
       payload: formData,
+      clientIds,
     });
 
     try {
+      let warehouseId: string;
+
       if (editingWarehouse) {
         await warehousesService.updateWarehouse(editingWarehouse.id, orgId, formData);
+        warehouseId = editingWarehouse.id;
         setSuccessMessage('Almacén actualizado correctamente');
       } else {
-        await warehousesService.createWarehouse(orgId, formData);
+        const newWarehouse = await warehousesService.createWarehouse(orgId, formData);
+        warehouseId = newWarehouse.id;
         setSuccessMessage('Almacén creado correctamente');
+      }
+
+      // Guardar asignación de clientes (si tiene permiso)
+      // Fallback: usar warehouses.update o admin.warehouses.clients.manage si admin.warehouses.update no existe
+      const canManageClients = can('admin.warehouses.update') || can('warehouses.update') || can('admin.warehouses.clients.manage');
+      console.log('[AlmacenesPage] 💾 Saving client assignments', { 
+        canManageClients, 
+        clientIdsCount: clientIds.length,
+        permissions: {
+          'admin.warehouses.update': can('admin.warehouses.update'),
+          'warehouses.update': can('warehouses.update'),
+          'admin.warehouses.clients.manage': can('admin.warehouses.clients.manage')
+        }
+      });
+      
+      if (canManageClients) {
+        await warehousesService.setWarehouseClients(orgId, warehouseId, clientIds);
+        console.log('[AlmacenesPage] ✅ Client assignments saved');
+      } else {
+        console.warn('[AlmacenesPage] ⚠️ User cannot manage clients - skipping assignment');
       }
 
       setShowModal(false);
       setEditingWarehouse(null);
+      setAssignedClientIds([]);
       await loadWarehouses();
 
       setTimeout(() => setSuccessMessage(null), 3000);
@@ -150,12 +261,35 @@ export default function AlmacenesPage() {
 
   const handleDelete = async (warehouse: Warehouse) => {
     if (!can('warehouses.delete')) {
-      alert('No tienes permisos para eliminar almacenes');
+      setConfirmModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Sin permisos',
+        message: 'No tienes permisos para eliminar almacenes',
+        onConfirm: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+      });
       return;
     }
 
-    if (!confirm(`¿Estás seguro de eliminar el almacén "${warehouse.name}"?`)) return;
+    // Mostrar modal de confirmación
+    setPendingDeleteWarehouse(warehouse);
+    setConfirmModal({
+      isOpen: true,
+      type: 'warning',
+      title: 'Confirmar eliminación',
+      message: `¿Estás seguro de eliminar el almacén "${warehouse.name}"? Esta acción no se puede deshacer.`,
+      showCancel: true,
+      onConfirm: () => confirmDeleteWarehouse(warehouse),
+      onCancel: () => {
+        setConfirmModal(prev => ({ ...prev, isOpen: false }));
+        setPendingDeleteWarehouse(null);
+      }
+    });
+  };
 
+  const confirmDeleteWarehouse = async (warehouse: Warehouse) => {
+    setConfirmModal(prev => ({ ...prev, isOpen: false }));
+    
     try {
       console.log('[AlmacenesPage] delete request', { id: warehouse.id });
       await warehousesService.deleteWarehouse(warehouse.id, orgId!);
@@ -165,7 +299,15 @@ export default function AlmacenesPage() {
     } catch (error) {
       console.error('[AlmacenesPage] delete error', error);
       const message = error instanceof Error ? error.message : 'Error al eliminar el almacén';
-      alert(message);
+      setConfirmModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: message,
+        onConfirm: () => setConfirmModal(prev => ({ ...prev, isOpen: false }))
+      });
+    } finally {
+      setPendingDeleteWarehouse(null);
     }
   };
 
@@ -204,6 +346,18 @@ export default function AlmacenesPage() {
       </div>
     );
   }
+
+  // Fallback: usar warehouses.update o admin.warehouses.clients.manage si admin.warehouses.update no existe
+  const canManageClients = can('admin.warehouses.update') || can('warehouses.update') || can('admin.warehouses.clients.manage');
+  
+  console.log('[AlmacenesPage] 🔐 Permissions check', {
+    'admin.warehouses.update': can('admin.warehouses.update'),
+    'warehouses.update': can('warehouses.update'),
+    'admin.warehouses.clients.manage': can('admin.warehouses.clients.manage'),
+    'canManageClients (final)': canManageClients,
+    'clients.length': clients.length,
+    'activeClients': clients.filter(c => c.is_active).length
+  });
 
   return (
     <div className="p-6">
@@ -380,13 +534,28 @@ export default function AlmacenesPage() {
           orgId={orgId}
           warehouse={editingWarehouse}
           countries={countries}
+          clients={clients}
+          assignedClientIds={assignedClientIds}
+          canManageClients={canManageClients}
           onClose={() => {
             setShowModal(false);
             setEditingWarehouse(null);
+            setAssignedClientIds([]);
           }}
           onSave={handleSave}
         />
       )}
+
+      {/* Modal de confirmación */}
+      <ConfirmModal
+        isOpen={confirmModal.isOpen}
+        type={confirmModal.type}
+        title={confirmModal.title}
+        message={confirmModal.message}
+        showCancel={confirmModal.showCancel}
+        onConfirm={confirmModal.onConfirm}
+        onCancel={confirmModal.onCancel}
+      />
     </div>
   );
 }

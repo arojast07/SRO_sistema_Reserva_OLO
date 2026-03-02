@@ -23,7 +23,7 @@ const safeText = (v: any, fallback = '-') => {
   return s.length ? s : fallback;
 };
 
-export function PendingReservationsGrid({ reservations, onOpenIngreso, isLoading }: PendingReservationsGridProps) {
+export default function PendingReservationsGrid({ reservations, onOpenIngreso, isLoading }: PendingReservationsGridProps) {
   const [searchTerm, setSearchTerm] = useState('');
 
   const filteredReservations = useMemo(() => {
@@ -90,46 +90,99 @@ export function PendingReservationsGrid({ reservations, onOpenIngreso, isLoading
           {searchTerm && <p className="text-sm text-gray-500 mt-1">Intenta con otro término de búsqueda</p>}
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead className="bg-gray-50 border-b border-gray-200">
-              <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">DUA</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">MATRÍCULA</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">CHOFER</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">PROVEEDOR</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">ALMACÉN</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider">OC</th>
-                <th className="px-4 py-3 text-center text-xs font-medium text-gray-700 uppercase tracking-wider">ACCIÓN</th>
-              </tr>
-            </thead>
-
-            <tbody className="bg-white divide-y divide-gray-200">
-              {filteredReservations.map((reservation) => (
-                <tr key={reservation.id} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-4 py-3 text-sm text-gray-900 font-medium">{safeText(reservation.dua)}</td>
-                  <td className="px-4 py-3 text-sm text-gray-900">{safeText(reservation.placa)}</td>
-                  <td className="px-4 py-3 text-sm text-gray-900">{safeText(reservation.chofer)}</td>
-                  <td className="px-4 py-3 text-sm text-gray-600">{safeText(reservation.provider_name, 'N/A')}</td>
-                  <td className="px-4 py-3 text-sm text-gray-600">{safeText(reservation.warehouse_name, 'N/A')}</td>
-                  <td className="px-4 py-3 text-sm text-gray-600">{safeText(reservation.orden_compra)}</td>
-                  <td className="px-4 py-3 text-center">
-                    <button
-                      onClick={() => onOpenIngreso(reservation)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700 transition-colors whitespace-nowrap"
-                    >
-                      <i className="ri-login-box-line"></i>
-                      Abrir Ingreso
-                    </button>
-                  </td>
+        <>
+          {/* Vista Desktop: Tabla con scroll horizontal */}
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 border-b border-gray-200">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">DUA</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">MATRÍCULA</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">CHOFER</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">PROVEEDOR</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">ALMACÉN</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">OC</th>
+                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-700 uppercase tracking-wider whitespace-nowrap">ACCIÓN</th>
                 </tr>
-              ))}
-            </tbody>
+              </thead>
 
-          </table>
-        </div>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {filteredReservations.map((reservation) => (
+                  <tr key={reservation.id} className="hover:bg-gray-50 transition-colors">
+                    <td className="px-4 py-3 text-sm text-gray-900 font-medium whitespace-nowrap">{safeText(reservation.dua)}</td>
+                    <td className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap">{safeText(reservation.placa)}</td>
+                    <td className="px-4 py-3 text-sm text-gray-900 whitespace-nowrap">{safeText(reservation.chofer)}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">{safeText(reservation.provider_name, 'N/A')}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">{safeText(reservation.warehouse_name, 'N/A')}</td>
+                    <td className="px-4 py-3 text-sm text-gray-600 whitespace-nowrap">{safeText(reservation.orden_compra)}</td>
+                    <td className="px-4 py-3 text-center">
+                      <button
+                        onClick={() => onOpenIngreso(reservation)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700 transition-colors whitespace-nowrap"
+                      >
+                        <i className="ri-login-box-line"></i>
+                        Abrir Ingreso
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Vista Mobile: Cards */}
+          <div className="md:hidden space-y-3">
+            {filteredReservations.map((reservation) => (
+              <div
+                key={reservation.id}
+                className="bg-white border border-gray-200 rounded-lg p-4 space-y-3 hover:shadow-md transition-shadow"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-xs font-medium text-gray-500 uppercase">DUA</span>
+                      <span className="text-sm font-bold text-gray-900">{safeText(reservation.dua)}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <i className="ri-truck-line text-gray-400 text-sm"></i>
+                      <span className="text-sm text-gray-900">{safeText(reservation.placa)}</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => onOpenIngreso(reservation)}
+                    className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-2 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700 transition-colors whitespace-nowrap"
+                  >
+                    <i className="ri-login-box-line"></i>
+                    Abrir
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div>
+                    <span className="text-gray-500 text-xs">Chofer:</span>
+                    <p className="text-gray-900 font-medium truncate">{safeText(reservation.chofer)}</p>
+                  </div>
+                  <div>
+                    <span className="text-gray-500 text-xs">OC:</span>
+                    <p className="text-gray-900 truncate">{safeText(reservation.orden_compra)}</p>
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-gray-100 space-y-1">
+                  <div className="flex items-center gap-2 text-xs">
+                    <i className="ri-building-line text-gray-400"></i>
+                    <span className="text-gray-600 truncate">{safeText(reservation.provider_name, 'N/A')}</span>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs">
+                    <i className="ri-store-line text-gray-400"></i>
+                    <span className="text-gray-600 truncate">{safeText(reservation.warehouse_name, 'N/A')}</span>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
       )}
     </div>
   );
 }
-

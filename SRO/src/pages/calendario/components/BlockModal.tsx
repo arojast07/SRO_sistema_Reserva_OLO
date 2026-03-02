@@ -1,6 +1,8 @@
+
 import { useState, useEffect } from 'react';
 import { usePermissions } from '../../../hooks/usePermissions';
 import { calendarService, type DockTimeBlock, type Dock } from '../../../services/calendarService';
+import { ConfirmModal } from '../../../components/base/ConfirmModal';
 
 interface BlockModalProps {
   block: DockTimeBlock | null;
@@ -18,6 +20,17 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
     end_datetime: '',
     reason: '',
   });
+
+  // Estado para notificaciones popup
+  const [notifyModal, setNotifyModal] = useState({
+    isOpen: false,
+    type: 'info' as 'info' | 'warning' | 'error' | 'success',
+    title: '',
+    message: '',
+  });
+
+  // Estado para confirmación de eliminación
+  const [confirmDeleteModal, setConfirmDeleteModal] = useState(false);
 
   useEffect(() => {
     if (block) {
@@ -43,12 +56,22 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
     e.preventDefault();
     
     if (!orgId) {
-      alert('No se pudo identificar la organización');
+      setNotifyModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error',
+        message: 'No se pudo identificar la organización'
+      });
       return;
     }
 
     if (!formData.dock_id || !formData.start_datetime || !formData.end_datetime || !formData.reason) {
-      alert('Por favor completa todos los campos');
+      setNotifyModal({
+        isOpen: true,
+        type: 'warning',
+        title: 'Campos incompletos',
+        message: 'Por favor completa todos los campos'
+      });
       return;
     }
 
@@ -56,7 +79,12 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
     const end = new Date(formData.end_datetime);
 
     if (end <= start) {
-      alert('La fecha de fin debe ser posterior a la fecha de inicio');
+      setNotifyModal({
+        isOpen: true,
+        type: 'warning',
+        title: 'Fecha inválida',
+        message: 'La fecha de fin debe ser posterior a la fecha de inicio'
+      });
       return;
     }
 
@@ -65,7 +93,12 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
 
       if (block) {
         // Actualizar no está implementado en el servicio, solo eliminar y crear
-        alert('La edición de bloqueos no está disponible. Por favor elimina y crea uno nuevo.');
+        setNotifyModal({
+          isOpen: true,
+          type: 'info',
+          title: 'Función no disponible',
+          message: 'La edición de bloqueos no está disponible. Por favor elimina y crea uno nuevo.'
+        });
       } else {
         await calendarService.createDockTimeBlock({
           org_id: orgId,
@@ -74,23 +107,29 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
           end_datetime: end.toISOString(),
           reason: formData.reason,
         });
+        onSave();
       }
-
-      onSave();
     } catch (error: any) {
       console.error('Error guardando bloqueo:', error);
-      alert(error.message || 'Error al guardar el bloqueo');
+      setNotifyModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error al guardar',
+        message: error.message || 'Error al guardar el bloqueo'
+      });
     } finally {
       setLoading(false);
     }
   };
 
-  const handleDelete = async () => {
+  const handleDeleteClick = () => {
+    setConfirmDeleteModal(true);
+  };
+
+  const handleDeleteConfirm = async () => {
     if (!block) return;
 
-    if (!confirm('¿Estás seguro de que deseas eliminar este bloqueo?')) {
-      return;
-    }
+    setConfirmDeleteModal(false);
 
     try {
       setLoading(true);
@@ -98,7 +137,12 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
       onSave();
     } catch (error: any) {
       console.error('Error eliminando bloqueo:', error);
-      alert(error.message || 'Error al eliminar el bloqueo');
+      setNotifyModal({
+        isOpen: true,
+        type: 'error',
+        title: 'Error al eliminar',
+        message: error.message || 'Error al eliminar el bloqueo'
+      });
     } finally {
       setLoading(false);
     }
@@ -205,7 +249,7 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
               {block && can('dock_blocks.delete') && (
                 <button
                   type="button"
-                  onClick={handleDelete}
+                  onClick={handleDeleteClick}
                   disabled={loading}
                   className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-medium disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
                 >
@@ -246,6 +290,28 @@ export default function BlockModal({ block, docks, onClose, onSave }: BlockModal
           </div>
         </form>
       </div>
+
+      {/* Modal de notificación */}
+      <ConfirmModal
+        isOpen={notifyModal.isOpen}
+        type={notifyModal.type}
+        title={notifyModal.title}
+        message={notifyModal.message}
+        onConfirm={() => setNotifyModal({ ...notifyModal, isOpen: false })}
+        onCancel={() => setNotifyModal({ ...notifyModal, isOpen: false })}
+      />
+
+      {/* Modal de confirmación de eliminación */}
+      <ConfirmModal
+        isOpen={confirmDeleteModal}
+        type="warning"
+        title="Confirmar eliminación"
+        message="¿Estás seguro de que deseas eliminar este bloqueo?"
+        confirmText="Eliminar"
+        cancelText="Cancelar"
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setConfirmDeleteModal(false)}
+      />
     </div>
   );
 }
